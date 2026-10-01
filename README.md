@@ -1,9 +1,9 @@
-# PUTM Tire — Tire Model Optimizer
+# PUTM Tire - Tire Model Optimizer
 
 Repozytorium zawiera dwa rozdzielone narzędzia:
 
-- `app.py` — desktopowy optimizer modelu opony na danych stanowiskowych TTC,
-- `traction_circle.py` — przeglądarka telemetrycznego wykresu G-G w Streamlit.
+- `app.py` - desktopowy optimizer modelu opony na danych stanowiskowych TTC,
+- `traction_circle.py` - przeglądarka telemetrycznego wykresu G-G w Streamlit.
 
 Obwiednia sił opony (`Fx`/`Fy`) nie jest tym samym co samochodowy wykres G-G
 (`ax`/`ay`), dlatego aplikacje i nazwy widoków są rozdzielone.
@@ -28,10 +28,10 @@ poleceniem `sudo apt install python3-tk`.
 
 ## Układ repozytorium i dane
 
-- `app.py`, `fitting.py`, `tire_model.py` — interfejs i obliczenia modelu opony.
-- `traction_circle.py` — osobna aplikacja do analizy telemetrii.
-- `img/` — grafiki interfejsu; `tests/` — testy jednostkowe.
-- `data/` — lokalne pomiary i eksporty; zobacz [opis katalogu](data/README.md).
+- `app.py`, `fitting.py`, `tire_model.py`, `distribution.py` — interfejs i obliczenia modelu opony.
+- `traction_circle.py` - osobna aplikacja do analizy telemetrii.
+- `img/` - grafiki interfejsu; `tests/` - testy jednostkowe.
+- `data/` - lokalne pomiary i eksporty; zobacz [opis katalogu](data/README.md).
 
 Pliki pomiarowe i eksporty w `data/` nie są częścią repozytorium. Aplikacja
 pozwala wskazać pliki `.mat` z dowolnego miejsca przez okno wyboru plików.
@@ -46,6 +46,14 @@ pozwala wskazać pliki `.mat` z dowolnego miejsca przez okno wyboru plików.
 4. Wybierz model i uruchom dopasowanie.
 5. Oceń RMSE, NRMSE, R², condition number oraz ostrzeżenia o parametrach na granicy.
 6. Eksportuj dane albo wszystkie wyniki dopasowań do JSON/CSV.
+
+Po dodaniu pliku aplikacja otwiera widok **Histogram danych** dla całego runu.
+Można przełączać kanały, m.in. ciśnienie, camber, temperatury, obciążenie i
+poślizg; lista pokazuje tylko kanały dostępne w danym pliku. Po przetworzeniu
+runów dostępne są także zbiorcze histogramy Cornering i Drive/Brake po filtrach.
+Liczba kubełków dopasowuje się do rozkładu danych, a po najechaniu na słupek
+wyświetla się dokładna liczba próbek w przedziale. Opcja „Zakres 1–99%”
+powiększa środek rozkładu i podaje liczbę próbek poza widocznym zakresem.
 
 ## Konwencje modelu
 

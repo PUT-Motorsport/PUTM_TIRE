@@ -30,8 +30,11 @@ class TireDataManagerTests(unittest.TestCase):
             )
 
             frame = TireDataManager.load_and_filter(config)
+            raw = TireDataManager.load_unfiltered(config)
 
             self.assertEqual(frame["__row__"].tolist(), [0, 1])
+            self.assertEqual(len(raw), 4)
+            self.assertEqual(raw["FZ"].tolist(), [995.0, 1005.0, 1000.0, 1300.0])
             self.assertEqual(frame["SA"].tolist(), [-3.0, -3.0])
             self.assertEqual(frame["FZ"].tolist(), [995.0, 1005.0])
             self.assertEqual(frame["FZ_RAW"].tolist(), [-995.0, -1005.0])

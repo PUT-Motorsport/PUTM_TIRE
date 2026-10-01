@@ -22,6 +22,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.ticker import MaxNLocator
 
 try:
     from PIL import Image, ImageTk
@@ -35,9 +36,26 @@ from tire_model import (
     pacejka_fy, pacejka_fx, pacejka_mz, pacejka_fy_load, pacejka_comb_Gyk
 )
 from fitting import build_combined_slip_targets, fit_combined_slip, fit_load_sensitive, fit_pure_magic
+from distribution import make_histogram
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGO_PATH = os.path.join(APP_DIR, "img", "logo.png")
+HISTOGRAM_MODE = "Histogram danych"
+HISTOGRAM_CHANNELS = {
+    "Ciśnienie (P)": ("P", ""),
+    "Camber (IA)": ("IA", "deg"),
+    "Temperatura wewnętrzna (TSTI)": ("TSTI", ""),
+    "Temperatura środkowa (TSTC)": ("TSTC", ""),
+    "Temperatura zewnętrzna (TSTO)": ("TSTO", ""),
+    "Obciążenie (FZ)": ("FZ", "N"),
+    "Kąt znoszenia (SA)": ("SA", "deg"),
+    "Poślizg wzdłużny (SL)": ("SL", ""),
+    "Prędkość (V)": ("V", ""),
+    "Czas (ET)": ("ET", ""),
+    "Siła boczna (FY)": ("FY", "N"),
+    "Siła wzdłużna (FX)": ("FX", "N"),
+    "Moment stabilizujący (MZ)": ("MZ", "Nm"),
+}
 
 # --------------------------------------------------------------------------
 # Paleta kolorów - motyw "PUTM Racing"
@@ -76,6 +94,10 @@ class PUTMTireApp(tk.Tk):
         self.df_drive = None     
         self.fit_result = None   
         self.fit_results = {}
+        self._hist_raw_key = None
+        self._hist_raw_frame = None
+        self._histogram_current = None
+        self._hist_hover_index = None
 
         self._build_style()
         self._build_header()
@@ -319,7 +341,8 @@ class PUTMTireApp(tk.Tk):
             "Fx (Siła wzdłużna)", 
             "Mz (Moment stabilizujący)",
             "Tire Force Envelope",
-            "Combined Slip (Gyk)"
+            "Combined Slip (Gyk)",
+            HISTOGRAM_MODE,
         ]
         self.cb_mode = ttk.Combobox(mode_frame, textvariable=self.plot_mode, values=modes, state="readonly", width=25)
         self.cb_mode.pack(side="left", padx=4)
@@ -328,16 +351,49 @@ class PUTMTireApp(tk.Tk):
         ttk.Button(mode_frame, text="⟳  Odśwież", command=self.update_plot_view).pack(side="left", padx=6)
         ttk.Button(mode_frame, text="✕  Wyczyść", command=self._reset_plot).pack(side="right")
 
+        self.hist_controls = ttk.Frame(box, style="Card.TFrame")
+        self.hist_controls.pack(fill="x", padx=10, pady=(0, 4))
+        self.hist_source = tk.StringVar()
+        self.hist_channel = tk.StringVar(value="Ciśnienie (P)")
+        self.hist_focus = tk.BooleanVar(value=False)
+        self._hist_sources = {}
+        source_row = ttk.Frame(self.hist_controls, style="Card.TFrame")
+        source_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(source_row, text="Dane:", style="Card.TLabel").pack(side="left")
+        self.cb_hist_source = ttk.Combobox(source_row, textvariable=self.hist_source,
+                                            state="readonly", width=42)
+        self.cb_hist_source.pack(side="left", padx=(4, 8))
+        self.cb_hist_source.bind("<<ComboboxSelected>>", lambda e: self.update_plot_view())
+        channel_row = ttk.Frame(self.hist_controls, style="Card.TFrame")
+        channel_row.pack(fill="x")
+        ttk.Label(channel_row, text="Kanał:", style="Card.TLabel").pack(side="left")
+        self.cb_hist_channel = ttk.Combobox(channel_row, textvariable=self.hist_channel,
+                                             state="readonly", width=30)
+        self.cb_hist_channel.pack(side="left", padx=(4, 8))
+        self.cb_hist_channel.bind("<<ComboboxSelected>>", lambda e: self.update_plot_view())
+        ttk.Checkbutton(channel_row, text="Zakres 1–99%", variable=self.hist_focus,
+                        command=self.update_plot_view).pack(side="left")
+        self.hist_summary = tk.StringVar()
+        self.hist_details = tk.StringVar()
+        self.hist_info = ttk.Frame(box, style="Card.TFrame")
+        self.hist_info.pack(fill="x", padx=12)
+        ttk.Label(self.hist_info, textvariable=self.hist_summary, style="Card.TLabel").pack(anchor="w")
+        ttk.Label(self.hist_info, textvariable=self.hist_details, style="Card.TLabel").pack(anchor="w")
+        self._refresh_histogram_sources()
+
         self.fig = Figure(figsize=(6, 5), dpi=100, facecolor=COLORS["panel"])
         self.ax = self.fig.add_subplot(111, facecolor=COLORS["panel"])
         self._cbar = None
         self._reset_plot()
 
         canvas_holder = ttk.Frame(box, style="Card.TFrame")
+        self._hist_canvas_holder = canvas_holder
         canvas_holder.pack(fill="both", expand=True, padx=10, pady=10)
         self.canvas = FigureCanvasTkAgg(self.fig, master=canvas_holder)
         self.canvas.get_tk_widget().configure(bg=COLORS["panel"], highlightthickness=0)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.canvas.mpl_connect("motion_notify_event", self._on_histogram_hover)
+        self._show_histogram_controls(False)
 
     def _build_statusbar(self):
         self.status = tk.StringVar(value="Gotowy. Załaduj pliki Cornering lub Drive/Brake.")
@@ -371,6 +427,7 @@ class PUTMTireApp(tk.Tk):
 
     def on_mode_change(self):
         mode = self.plot_mode.get()
+        self._show_histogram_controls(mode == HISTOGRAM_MODE)
         if mode == "Fy (Siła boczna)":
             self.fit_btn_text.set("📈  Dopasuj model Fy0 (Pure Slip)")
         elif mode == "Fy (Load Sensitivity)":
@@ -381,11 +438,127 @@ class PUTMTireApp(tk.Tk):
             self.fit_btn_text.set("📈  Dopasuj model Mz0 (Aligning Torque)")
         elif mode == "Combined Slip (Gyk)":
             self.fit_btn_text.set("📈  Dopasuj Combined Slip (Gyk)")
+        elif mode == HISTOGRAM_MODE:
+            self.fit_btn_text.set("📈  Histogram nie wymaga dopasowania")
         else:
             self.fit_btn_text.set("📈  Brak dopasowania dla obwiedni")
         self.update_plot_view()
 
+    def _show_histogram_controls(self, visible):
+        if visible:
+            self.hist_controls.pack(fill="x", padx=10, pady=(0, 4), before=self._hist_canvas_holder)
+            self.hist_info.pack(fill="x", padx=12, before=self._hist_canvas_holder)
+        else:
+            self.hist_controls.pack_forget()
+            self.hist_info.pack_forget()
+
+    def _refresh_histogram_sources(self, preferred=None):
+        previous = self._hist_sources.get(self.hist_source.get()) if hasattr(self, "hist_source") else None
+        sources = {}
+        if self.df_cornering is not None and not self.df_cornering.empty:
+            sources["Cornering · po filtrach"] = ("filtered", "Cornering")
+        if self.df_drive is not None and not self.df_drive.empty:
+            sources["Drive/Brake · po filtrach"] = ("filtered", "Drive/Brake")
+        for index, run in enumerate(self.runs):
+            label = f"{index + 1}. {run.test_type} · {os.path.basename(run.filepath)} (cały plik)"
+            sources[label] = ("raw", index)
+        self._hist_sources = sources
+        self.cb_hist_source.configure(values=list(sources))
+        selected = preferred if preferred in sources.values() else previous
+        label = next((name for name, key in sources.items() if key == selected), None)
+        self.hist_source.set(label or next(iter(sources), ""))
+
+    def _histogram_frame(self):
+        selected = self._hist_sources.get(self.hist_source.get())
+        if selected is None:
+            return None
+        scope, identifier = selected
+        if scope == "filtered":
+            return self.df_cornering if identifier == "Cornering" else self.df_drive
+        run = self.runs[identifier]
+        key = (identifier, run.filepath)
+        if key != self._hist_raw_key:
+            self._hist_raw_frame = TireDataManager.load_unfiltered(run)
+            self._hist_raw_key = key
+        return self._hist_raw_frame
+
+    def _draw_histogram(self):
+        try:
+            frame = self._histogram_frame()
+        except (OSError, ValueError, KeyError) as exc:
+            self.hist_summary.set(f"Nie można odczytać pliku: {exc}")
+            self.hist_details.set("")
+            self.canvas.draw()
+            return
+        if frame is None or frame.empty:
+            self.hist_summary.set("Dodaj plik .mat, aby zobaczyć rozkład danych.")
+            self.hist_details.set("")
+            self.canvas.draw()
+            return
+
+        available = [label for label, (name, _) in HISTOGRAM_CHANNELS.items()
+                     if name in frame and np.isfinite(pd.to_numeric(frame[name], errors="coerce")).any()]
+        self.cb_hist_channel.configure(values=available)
+        if not available:
+            self.hist_summary.set("Brak kanałów liczbowych z poprawnymi próbkami.")
+            self.hist_details.set("")
+            self.canvas.draw()
+            return
+        if self.hist_channel.get() not in available:
+            self.hist_channel.set(available[0])
+        label = self.hist_channel.get()
+        name, unit = HISTOGRAM_CHANNELS[label]
+        result = make_histogram(pd.to_numeric(frame[name], errors="coerce"), focus=self.hist_focus.get())
+        self._histogram_current = result
+        self._hist_hover_index = None
+
+        edges, counts = result.edges, result.counts
+        self.ax.bar(edges[:-1], counts, width=np.diff(edges) * 0.96, align="edge",
+                    color=COLORS["accent"], edgecolor=COLORS["accent_hover"], linewidth=0.5)
+        self.ax.set_xlim(edges[0], edges[-1])
+        self.ax.set_ylim(0, max(1.2, float(counts.max()) * 1.16))
+        self.ax.yaxis.set_major_locator(MaxNLocator(integer=True, nbins=7))
+        self.ax.xaxis.set_major_locator(MaxNLocator(nbins=8))
+        self.ax.set_xlabel(f"{label} [{unit}]" if unit else label)
+        self.ax.set_ylabel("Liczba próbek")
+        self.ax.set_title(f"Rozkład {name}")
+        if len(counts) <= 16:
+            for left, right, count in zip(edges[:-1], edges[1:], counts):
+                if count:
+                    self.ax.text((left + right) / 2, count, str(count), ha="center", va="bottom",
+                                 fontsize=8, color=COLORS["text"])
+        self._style_axes()
+        self.fig.tight_layout(pad=2)
+        missing = result.total - result.finite
+        grouped = lambda value: f"{value:,}".replace(",", " ")
+        summary = f"Próbki: {grouped(result.finite)}/{grouped(result.total)} · kubełki: {len(counts)}"
+        if missing:
+            summary += f" · brak/∞: {grouped(missing)}"
+        if result.below or result.above:
+            summary += f" · poza widokiem: {grouped(result.below)} poniżej, {grouped(result.above)} powyżej"
+        self.hist_summary.set(summary)
+        self.hist_details.set("Najedź na słupek, aby zobaczyć przedział i dokładną liczbę próbek.")
+        self.canvas.draw()
+
+    def _on_histogram_hover(self, event):
+        result = self._histogram_current
+        if result is None or event.inaxes != self.ax or event.xdata is None:
+            return
+        index = int(np.searchsorted(result.edges, event.xdata, side="right") - 1)
+        if event.xdata == result.edges[-1]:
+            index = len(result.counts) - 1
+        if index < 0 or index >= len(result.counts) or index == self._hist_hover_index:
+            return
+        self._hist_hover_index = index
+        count = int(result.counts[index])
+        percentage = 100 * count / result.finite
+        self.hist_details.set(
+            f"{result.edges[index]:.6g} – {result.edges[index + 1]:.6g}: "
+            f"{count:,}".replace(",", " ") + f" próbek ({percentage:.1f}%)"
+        )
+
     def _reset_plot(self):
+        self._histogram_current = None
         if getattr(self, "_cbar", None) is not None:
             try:
                 self._cbar.remove()
@@ -405,7 +578,11 @@ class PUTMTireApp(tk.Tk):
         # slip plots combine quantities with very different numerical ranges.
         self.ax.set_aspect("auto", adjustable="box")
 
-        if "Fy" in mode:
+        if mode == HISTOGRAM_MODE:
+            self.ax.set_xlabel("Wartość kanału")
+            self.ax.set_ylabel("Liczba próbek")
+            self.ax.set_title("Rozkład danych")
+        elif "Fy" in mode:
             self.ax.set_xlabel("Kąt znoszenia SA [deg]")
             self.ax.set_ylabel("Siła boczna Fy [N]")
             self.ax.set_title("Pacejka Fy – Siła boczna od kąta znoszenia")
@@ -427,8 +604,9 @@ class PUTMTireApp(tk.Tk):
             self.ax.set_title("Tire Force Envelope (Fx vs Fy)")
             self.ax.set_aspect("equal", adjustable="box")
 
-        self.ax.axhline(0, color=COLORS["text_muted"], linewidth=0.8, linestyle="--")
-        self.ax.axvline(0, color=COLORS["text_muted"], linewidth=0.8, linestyle="--")
+        if mode != HISTOGRAM_MODE:
+            self.ax.axhline(0, color=COLORS["text_muted"], linewidth=0.8, linestyle="--")
+            self.ax.axvline(0, color=COLORS["text_muted"], linewidth=0.8, linestyle="--")
         self._style_axes()
 
         if hasattr(self, "canvas"):
@@ -476,7 +654,11 @@ class PUTMTireApp(tk.Tk):
             )
             self.runs.append(run)
 
+        self._invalidate_processed_data()
         self._refresh_run_list()
+        self._refresh_histogram_sources(preferred=("raw", len(self.runs) - 1))
+        self.plot_mode.set(HISTOGRAM_MODE)
+        self.on_mode_change()
         self._set_status(f"Dodano {len(paths)} run'ów [{test_type}].")
 
     def remove_selected_runs(self):
@@ -486,8 +668,23 @@ class PUTMTireApp(tk.Tk):
         indices = sorted([self.run_list.index(item) for item in sel], reverse=True)
         for idx in indices:
             del self.runs[idx]
+        self._invalidate_processed_data()
+        self._hist_raw_key = None
+        self._hist_raw_frame = None
         self._refresh_run_list()
+        self._refresh_histogram_sources()
+        if self.plot_mode.get() == HISTOGRAM_MODE:
+            self.update_plot_view()
         self._set_status(f"Usunięto {len(indices)} run(ów).")
+
+    def _invalidate_processed_data(self):
+        self.df_cornering = None
+        self.df_drive = None
+        self.fit_result = None
+        self.fit_results.clear()
+        for run in self.runs:
+            run.n_points = 0
+        self._show_plain_results("Lista runów zmieniła się. Przetwórz je ponownie przed dopasowaniem.")
 
     def _refresh_run_list(self):
         for item in self.run_list.get_children():
@@ -535,6 +732,12 @@ class PUTMTireApp(tk.Tk):
         )
         self.fit_result = None
         self.fit_results.clear()
+        preferred_type = self.runs[-1].test_type
+        preferred = ("filtered", preferred_type) if (
+            (preferred_type == "Cornering" and self.df_cornering is not None)
+            or (preferred_type == "Drive/Brake" and self.df_drive is not None)
+        ) else None
+        self._refresh_histogram_sources(preferred=preferred)
         self._show_plain_results("Dane zmieniły się. Poprzednie wyniki dopasowania zostały unieważnione.")
 
         total = (len(self.df_cornering) if self.df_cornering is not None else 0) + \
@@ -545,7 +748,8 @@ class PUTMTireApp(tk.Tk):
             return messagebox.showerror("Błąd przetwarzania", "\n".join(errors) if errors else "Brak punktów zgodnych z filtrami.")
 
         self._set_status(f"Załadowano {total} punktów; błędne pliki: {len(errors)}.")
-        self.update_plot_view()
+        self.plot_mode.set(HISTOGRAM_MODE)
+        self.on_mode_change()
         if errors:
             messagebox.showwarning("Przetworzono z ostrzeżeniami", f"Załadowano punktów: {total}\n\n" + "\n".join(errors))
         else:
@@ -554,6 +758,10 @@ class PUTMTireApp(tk.Tk):
     def update_plot_view(self):
         mode = self.plot_mode.get()
         self._reset_plot()
+
+        if mode == HISTOGRAM_MODE:
+            self._draw_histogram()
+            return
 
         if mode == "Fy (Siła boczna)":
             if self.df_cornering is None or len(self.df_cornering) == 0:

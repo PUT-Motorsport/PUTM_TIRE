@@ -166,24 +166,15 @@ class TireDataManager:
         return pd.DataFrame(values)
 
     @classmethod
-    def load_and_filter(cls, run: RunConfig) -> pd.DataFrame:
+    def load_unfiltered(cls, run: RunConfig) -> pd.DataFrame:
+        """Read available measurement channels without applying UI filters."""
         mat_data = scipy.io.loadmat(run.filepath)
-
         if run.test_type == "Cornering":
             df = cls._build_frame(
                 mat_data,
                 required=["SA", "FY", "FZ", "IA"],
                 optional=["MZ", "FX", "SL", "ET", "V", "P", "TSTI", "TSTC", "TSTO"],
             )
-            df["FZ_RAW"] = df["FZ"]
-            df["FZ"] = np.abs(df["FZ"])
-            finite = np.isfinite(df[["SA", "FY", "FZ", "IA"]]).all(axis=1)
-            filtered = df[
-                finite
-                & (np.abs(df["IA"] - run.target_param) <= run.tol_param)
-                & (np.abs(df["FZ"] - abs(run.target_fz)) <= run.tol_fz)
-            ].copy()
-
         elif run.test_type == "Drive/Brake":
             required = ["FX", "SL", "FZ"]
             if run.target_sa is not None:
@@ -192,8 +183,25 @@ class TireDataManager:
                 required.append("IA")
             optional = [name for name in ["FY", "MZ", "SA", "IA", "ET", "V", "P", "TSTI", "TSTC", "TSTO"] if name not in required]
             df = cls._build_frame(mat_data, required=required, optional=optional)
-            df["FZ_RAW"] = df["FZ"]
-            df["FZ"] = np.abs(df["FZ"])
+        else:
+            raise ValueError(f"Nieobsługiwany typ testu: {run.test_type}")
+        df["FZ_RAW"] = df["FZ"]
+        df["FZ"] = np.abs(df["FZ"])
+        return df
+
+    @classmethod
+    def load_and_filter(cls, run: RunConfig) -> pd.DataFrame:
+        df = cls.load_unfiltered(run)
+
+        if run.test_type == "Cornering":
+            finite = np.isfinite(df[["SA", "FY", "FZ", "IA"]]).all(axis=1)
+            filtered = df[
+                finite
+                & (np.abs(df["IA"] - run.target_param) <= run.tol_param)
+                & (np.abs(df["FZ"] - abs(run.target_fz)) <= run.tol_fz)
+            ].copy()
+
+        elif run.test_type == "Drive/Brake":
             finite = np.isfinite(df[["FX", "SL", "FZ"]]).all(axis=1)
             selection = (
                 finite
@@ -207,9 +215,6 @@ class TireDataManager:
             filtered = df[
                 selection
             ].copy()
-        else:
-            raise ValueError(f"Nieobsługiwany typ testu: {run.test_type}")
-
         filtered["__row__"] = filtered.index.astype(int)
         filtered["__source__"] = os.path.basename(run.filepath)
         filtered["__source_path__"] = os.path.abspath(run.filepath)
