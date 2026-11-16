@@ -1,1121 +1,1593 @@
 """
-PUTM Tire - Tire Model Optimizer (Cornering + Drive/Brake & Friction Circle)
-==========================================================================
-Uruchomienie:
-    python3 -m pip install -r requirements.txt
-    python3 app.py
+PUTM Tire Lab — Formula Student Tire Modeling & Telemetry Suite.
+
+Carbon Motorsport Telemetry Edition:
+- Streamlined Top-Bar Unified Import & Export Studio (single entry points, zero clutter)
+- 7-step left SidebarNav workflow:
+    01. Telemetry Data         -> .mat/.csv/.txt/.dat queue, condition filters, histograms
+    02. Model Fitting          -> 1-Click Autopilot MF 5.1 + Single Curve & Matrix Auto-Fit
+    03. MF 5.1 Model (.TIR)    -> PAC2002 parameters, surface scaling, 18x6 -> 16x7.5 R20 scaler
+    04. 3D & G-G Simulator     -> 3D force surfaces, friction cone, live SA x SL grip monitor
+    05. Tire Comparator (.TIR) -> Up to 4 compounds, Benchmark KPI table & Radar
+    06. Cornering Stiffness    -> Linear CFa(Fz, IA, P) regression with dwell/SL filtering & A vs B
+    07. 2D Curve Sketcher      -> Fast Physical vs B/C/D/E Magic Formula calculator
 """
 
-import os
-import sys
+from __future__ import annotations
+
 import json
-import traceback
-from dataclasses import asdict
+import os
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from typing import Dict, Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
-
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-
-import matplotlib
-matplotlib.use("TkAgg")
-from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.ticker import MaxNLocator
+from matplotlib.figure import Figure
 
-try:
-    from PIL import Image, ImageTk
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
-
-# Importy z nowego backendu
-from tire_model import (
-    RunConfig, TireDataManager, 
-    pacejka_fy, pacejka_fx, pacejka_mz, pacejka_fy_load, pacejka_comb_Gyk
-)
-from fitting import build_combined_slip_targets, fit_combined_slip, fit_load_sensitive, fit_pure_magic
+from auto_mf51_extractor import AutoMF51Extractor
+from condition_export_dialog import ConditionExportDialog, open_excel_export
 from distribution import make_histogram
+from fitting import (
+    fit_combined_slip,
+    fit_load_sensitive,
+    fit_pure_magic,
+)
+from hub_tab import HubTab, generate_fsae_demo_telemetry
+from io_dialogs import UnifiedExportDialog, UnifiedImportDialog
+from matrix_autofit_dialog import MatrixAutoFitDialog
+from mf51_model import MF51Model
+from mf51_tab import MF51Tab
+from simple_pacejka_tab import SimplePacejkaTab
+from stiffness_tab import StiffnessTab
+from tire_model import RunConfig, TireDataManager
+from tir_analyzer_dialog import TirAnalyzerTab
+from tir_parser import load_tir_to_model
+from ui_scroll import ScrollableFrame
+from ui_theme import (
+    CHART_PALETTE,
+    FONT_DISPLAY,
+    FONT_MONO,
+    FONT_SMALL,
+    FONT_SMALL_BOLD,
+    PALETTE,
+    KpiTile,
+    ModernCard,
+    SegmentedToggle,
+    SidebarNav,
+    StatusBanner,
+    StepHeader,
+    apply_ttk_theme,
+    load_brand_logo,
+    style_axes_2d,
+    style_legend,
+    style_treeview_zebra,
+)
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-LOGO_PATH = os.path.join(APP_DIR, "img", "logo.png")
-HISTOGRAM_MODE = "Histogram danych"
-HISTOGRAM_CHANNELS = {
-    "Ciśnienie (P)": ("P", ""),
-    "Camber (IA)": ("IA", "deg"),
-    "Temperatura wewnętrzna (TSTI)": ("TSTI", ""),
-    "Temperatura środkowa (TSTC)": ("TSTC", ""),
-    "Temperatura zewnętrzna (TSTO)": ("TSTO", ""),
-    "Obciążenie (FZ)": ("FZ", "N"),
-    "Kąt znoszenia (SA)": ("SA", "deg"),
-    "Poślizg wzdłużny (SL)": ("SL", ""),
-    "Prędkość (V)": ("V", ""),
-    "Czas (ET)": ("ET", ""),
-    "Siła boczna (FY)": ("FY", "N"),
-    "Siła wzdłużna (FX)": ("FX", "N"),
-    "Moment stabilizujący (MZ)": ("MZ", "Nm"),
+
+HISTOGRAM_CHANNELS = [
+    ("SA", "Slip Angle SA [deg]"),
+    ("FY", "Lateral Force FY [N]"),
+    ("FZ", "Vertical Load FZ [N]"),
+    ("IA", "Camber IA [deg]"),
+    ("SL", "Longitudinal Slip SL [-]"),
+    ("FX", "Longitudinal Force FX [N]"),
+    ("MZ", "Aligning Torque MZ [Nm]"),
+    ("P", "Pressure P [kPa / psi]"),
+    ("V", "Speed V [km/h]"),
+]
+
+FIT_MODELS = [
+    ("Fy0", "Fy0(SA) — Pure Lateral Force"),
+    ("Fy_load", "Fy_load(SA, Fz) — Load-Sensitive 3D Surface"),
+    ("Fx0", "Fx0(SL) — Pure Drive / Braking"),
+    ("Mz0", "Mz0(SA) — Aligning Torque"),
+    ("CombinedSlip", "CombinedSlip Gyk(SL) — Grip Reduction"),
+    ("Mu_Fz", "Mu_Fz(Fz) — Peak Friction vs Load"),
+    ("Envelope", "Envelope G-G — Peak Friction Circle"),
+]
+
+PARAM_DESCRIPTIONS: Dict[str, tuple] = {
+    "B": ("1/rad or -", "Initial stiffness factor"),
+    "C": ("-", "Curve shape factor"),
+    "D": ("N or Nm", "Peak force / torque amplitude"),
+    "E": ("-", "Curvature factor past peak"),
+    "Sh": ("rad or -", "Horizontal shift (plysteer / offset)"),
+    "Sv": ("N or Nm", "Vertical shift"),
+    "Bx": ("-", "Longitudinal stiffness factor (SL)"),
+    "Cx": ("-", "Longitudinal shape factor"),
+    "Dx": ("N", "Peak longitudinal force"),
+    "Ex": ("-", "Longitudinal curvature factor"),
+    "Shx": ("-", "Horizontal SL shift"),
+    "Svx": ("N", "Vertical Fx shift"),
+    "Bz": ("1/rad", "Aligning torque stiffness factor"),
+    "Cz": ("-", "Aligning torque shape factor"),
+    "Dz": ("Nm", "Peak aligning torque Mz"),
+    "Ez": ("-", "Aligning torque curvature factor"),
+    "pCy1": ("-", "Load-sensitive Fy0 shape factor"),
+    "pDy1": ("-", "Nominal friction mu_y at Fz0"),
+    "pDy2": ("-", "Load sensitivity slope d(mu_y)/dfz"),
+    "pEy1": ("-", "Lateral curvature at Fz0"),
+    "pKy1": ("1/rad", "Normalized cornering stiffness Ky/Fz0"),
+    "pKy2": ("-", "Load saturation factor PKY2"),
+    "pUy1": ("rad", "Horizontal shift PHY1"),
+    "pVy1": ("-", "Vertical shift PVY1/Fz0"),
+    "fz0": ("N", "Nominal reference load FNOMIN"),
+    "rBy1": ("-", "Combined-slip grip reduction slope Gyk"),
+    "rCy1": ("-", "Combined-slip shape factor Gyk"),
+    "pDx1": ("-", "Nominal friction mu_x at Fz0"),
+    "pDx2": ("-", "Load sensitivity slope d(mu_x)/dfz"),
 }
 
-# --------------------------------------------------------------------------
-# Paleta kolorów - motyw "PUTM Racing"
-# --------------------------------------------------------------------------
-COLORS = {
-    "bg":          "#17181a",
-    "bg_header":   "#0f0f10",
-    "panel":       "#212226",
-    "panel_alt":   "#2a2c30",
-    "input":       "#2d2f34",
-    "border":      "#3a3c42",
-    "text":        "#eaeaea",
-    "text_muted":  "#9a9ca3",
-    "accent":      "#e0521c",
-    "accent_hover":"#ff6a2e",
-    "accent_dark": "#a83e14",
-    "ok":          "#3ddc84",
-    "warn":        "#f2c94c",
-}
-
-FONT_BASE = ("Segoe UI", 9)
-FONT_BOLD = ("Segoe UI", 9, "bold")
-FONT_HEAD = ("Segoe UI", 10, "bold")
-FONT_MONO = ("Consolas", 9)
+NAV_KEYS = ("data", "fit", "model", "sim3d", "compare", "stiffness", "sketch")
 
 
-class PUTMTireApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("PUTM Tire — Tire Model Optimizer")
-        self.geometry("1340x840")
-        self.minsize(1150, 740)
+class PUTMTireApp:
+    """Main PUTM Tire Lab application with unified Import/Export hubs and telemetry dark UI."""
 
-        self.runs = []           
-        self.df_cornering = None 
-        self.df_drive = None     
-        self.fit_result = None   
-        self.fit_results = {}
-        self._hist_raw_key = None
-        self._hist_raw_frame = None
-        self._histogram_current = None
-        self._hist_hover_index = None
+    def __init__(self, root: Optional[tk.Tk] = None):
+        self.root = root or tk.Tk()
+        self.c = PALETTE
 
-        self._build_style()
-        self._build_header()
-        self._build_body()
-        self._build_statusbar()
+        self.root.title("PUTM Tire Lab — Formula Student Tire Dynamics Suite")
+        self.root.geometry("1346x706+8+8")
+        self.root.minsize(1140, 640)
+        self.root.configure(bg=self.c["bg"])
+        apply_ttk_theme(self.root, self.c)
 
-    def _build_style(self):
-        self.configure(bg=COLORS["bg"])
+        # Shared application state
+        self.runs: List[RunConfig] = []
+        self.raw_cache: dict = {}
+        self.df_cornering: Optional[pd.DataFrame] = None
+        self.df_drive: Optional[pd.DataFrame] = None
+        self.fit_results: Dict[str, dict] = {}
+        self.fit_result: Optional[dict] = None
+        self.model: MF51Model = MF51Model()
+        self._active_model_name: str = "Hoosier 18x6-10 R25B (Preset)"
+        self._active_key: str = "data"
+        self._syncing_views: bool = False
+        self._autopilot_running: bool = False
 
-        style = ttk.Style(self)
+        self._hist_cache: Optional[dict] = None
+
+        # UI state variables
+        self.var_status = tk.StringVar(value="Ready — click 'Import...' to load .MAT/.CSV telemetry, .TIR files, or FSAE Demo.")
+        self.var_run_type = tk.StringVar(value="Cornering")
+        self.var_target_fz = tk.StringVar(value="900")
+        self.var_tol_fz = tk.StringVar(value="200")
+        self.var_target_param = tk.StringVar(value="0")
+        self.var_tol_param = tk.StringVar(value="0.6")
+        self.var_drive_sa = tk.StringVar(value="0")
+        self.var_drive_sa_tol = tk.StringVar(value="1.0")
+
+        self.var_hist_source = tk.StringVar(value="Cornering")
+        self.var_hist_channel = tk.StringVar(value=HISTOGRAM_CHANNELS[0][1])
+        self.var_hist_focus = tk.BooleanVar(value=True)
+
+        self.var_autopilot_p = tk.StringVar(value="")
+        self.var_fit_model = tk.StringVar(value=FIT_MODELS[0][1])
+        self.var_fit_fz_slice = tk.StringVar(value="")
+        self.var_fit_c0 = tk.StringVar(value="1.30")
+
+        self._views: Dict[str, tk.Widget] = {}
+
+        self._build_shell()
+        self._build_step1_data()
+        self._build_step2_fit()
+        self._build_step3_model()
+        self._build_step4_sim3d()
+        self._build_step5_compare()
+        self._build_tool6_stiffness()
+        self._build_tool7_sketch()
+
+        self.switch_tab("data")
+        self._update_telemetry_badges()
+
+    # ------------------------------------------------------------------
+    # MODEL & STATUS COORDINATION
+    # ------------------------------------------------------------------
+    def set_status(self, msg: str):
+        self.var_status.set(msg)
+
+    def get_model(self) -> MF51Model:
+        return self.model
+
+    def set_model(self, model: MF51Model):
+        self.model = model
+        self._active_model_name = self._describe_model(model)
+
+    def _describe_model(self, model: MF51Model) -> str:
+        w = model.get("WIDTH", 0.1524)
+        r0 = model.get("UNLOADED_RADIUS", 0.2286)
+        if abs(w - 0.180) < 0.015 or abs(r0 - 0.205) < 0.012:
+            return "Hoosier 16x7.5-10 R20"
+        return f"MF 5.1 (R0={r0*1000:.0f}mm)"
+
+    def on_model_updated(self):
+        """Sync active MF51Model across Step 3, Step 4, and Step 5."""
+        if self._syncing_views:
+            return
+        self._syncing_views = True
         try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
+            if hasattr(self, "mf51_tab"):
+                self.mf51_tab.sync_from_model(redraw=True)
+            if hasattr(self, "hub_tab"):
+                self.hub_tab.sync_from_model(redraw=(self._active_key == "sim3d"))
+            if hasattr(self, "tir_tab"):
+                self.tir_tab.sync_active_model(redraw=(self._active_key == "compare"))
+        finally:
+            self._syncing_views = False
+        self._update_telemetry_badges()
 
-        style.configure(".", background=COLORS["bg"], foreground=COLORS["text"],
-                        fieldbackground=COLORS["input"], font=FONT_BASE,
-                        bordercolor=COLORS["border"], darkcolor=COLORS["panel"],
-                        lightcolor=COLORS["panel"], troughcolor=COLORS["bg"])
+    def _update_telemetry_badges(self):
+        c = self.c
+        n_c = len(self.df_cornering) if self.df_cornering is not None else 0
+        n_d = len(self.df_drive) if self.df_drive is not None else 0
+        total = n_c + n_d
 
-        style.configure("TFrame", background=COLORS["bg"])
-        style.configure("Card.TFrame", background=COLORS["panel"])
-
-        style.configure("TLabel", background=COLORS["bg"], foreground=COLORS["text"])
-        style.configure("Card.TLabel", background=COLORS["panel"], foreground=COLORS["text"])
-        style.configure("Muted.TLabel", background=COLORS["panel"], foreground=COLORS["text_muted"])
-        style.configure("Section.TLabel", background=COLORS["panel"], foreground=COLORS["accent"], font=FONT_HEAD)
-
-        style.configure("TLabelframe", background=COLORS["panel"], foreground=COLORS["text"],
-                        bordercolor=COLORS["border"], relief="solid", borderwidth=1)
-        style.configure("TLabelframe.Label", background=COLORS["panel"], foreground=COLORS["accent"], font=FONT_HEAD)
-
-        style.configure("TButton", background=COLORS["panel_alt"], foreground=COLORS["text"],
-                        borderwidth=0, focusthickness=0, padding=(10, 7), font=FONT_BASE)
-        style.map("TButton",
-                  background=[("active", COLORS["border"]), ("disabled", COLORS["panel"])],
-                  foreground=[("disabled", COLORS["text_muted"])])
-
-        style.configure("Accent.TButton", background=COLORS["accent"], foreground="white",
-                        borderwidth=0, focusthickness=0, padding=(12, 8), font=FONT_BOLD)
-        style.map("Accent.TButton",
-                  background=[("active", COLORS["accent_hover"]), ("disabled", COLORS["panel_alt"])])
-
-        style.configure("Danger.TButton", background="#3a2020", foreground="#ff9a8a",
-                        borderwidth=0, padding=(10, 7), font=FONT_BASE)
-        style.map("Danger.TButton", background=[("active", "#552626")])
-
-        style.configure("TEntry", fieldbackground=COLORS["input"], foreground=COLORS["text"],
-                        bordercolor=COLORS["border"], insertcolor=COLORS["text"], padding=5)
-        style.map("TEntry", bordercolor=[("focus", COLORS["accent"])])
-
-        style.configure("TCombobox", fieldbackground=COLORS["input"], foreground=COLORS["text"],
-                        background=COLORS["input"], arrowcolor=COLORS["text"], padding=5)
-        style.map("TCombobox",
-                  fieldbackground=[("readonly", COLORS["input"])],
-                  foreground=[("readonly", COLORS["text"])])
-        self.option_add("*TCombobox*Listbox.background", COLORS["input"])
-        self.option_add("*TCombobox*Listbox.foreground", COLORS["text"])
-        self.option_add("*TCombobox*Listbox.selectBackground", COLORS["accent"])
-
-        style.configure("TNotebook", background=COLORS["bg"], borderwidth=0)
-        style.configure("TNotebook.Tab", background=COLORS["panel_alt"],
-                        foreground=COLORS["text_muted"], padding=(16, 9), font=FONT_BOLD, borderwidth=0)
-        style.map("TNotebook.Tab",
-                  background=[("selected", COLORS["accent"])],
-                  foreground=[("selected", "white")],
-                  expand=[("selected", [0, 0, 0, 0])])
-
-        style.configure("Treeview", background=COLORS["panel"], fieldbackground=COLORS["panel"],
-                        foreground=COLORS["text"], bordercolor=COLORS["border"],
-                        rowheight=24, borderwidth=0, font=FONT_BASE)
-        style.configure("Treeview.Heading", background=COLORS["panel_alt"],
-                        foreground=COLORS["accent"], font=FONT_BOLD, relief="flat")
-        style.map("Treeview.Heading", background=[("active", COLORS["border"])])
-        style.map("Treeview",
-                  background=[("selected", COLORS["accent"])],
-                  foreground=[("selected", "white")])
-
-        style.configure("Vertical.TScrollbar", background=COLORS["panel_alt"],
-                        troughcolor=COLORS["bg"], bordercolor=COLORS["bg"], arrowcolor=COLORS["text_muted"])
-
-    def _build_header(self):
-        header = tk.Frame(self, bg=COLORS["bg_header"], height=78)
-        header.pack(side="top", fill="x")
-        header.pack_propagate(False)
-
-        logo_holder = tk.Frame(header, bg=COLORS["bg_header"])
-        logo_holder.pack(side="left", padx=18, pady=10)
-
-        self._logo_img = None
-        if PIL_AVAILABLE and os.path.exists(LOGO_PATH):
-            try:
-                img = Image.open(LOGO_PATH)
-                img.thumbnail((240, 58))
-                self._logo_img = ImageTk.PhotoImage(img)
-                tk.Label(logo_holder, image=self._logo_img, bg=COLORS["bg_header"]).pack()
-            except Exception:
-                tk.Label(logo_holder, text="PUTM TIRE", fg="white", bg=COLORS["bg_header"], font=("Segoe UI", 19, "bold")).pack()
+        if total > 0:
+            self.lbl_data_pill.config(
+                text=f"TTC Data: {total:,} pts",
+                bg=c["ok_soft"],
+                fg=c["ok"],
+            )
+            self.sidebar.set_item_status("data", "ok", f"{len(self.runs)} file(s) | {total:,} pts")
+            if hasattr(self, "fit_empty_banner"):
+                self.fit_empty_banner.pack_forget()
         else:
-            tk.Label(logo_holder, text="PUTM TIRE", fg="white", bg=COLORS["bg_header"], font=("Segoe UI", 19, "bold")).pack()
+            self.lbl_data_pill.config(
+                text="TTC Data: empty",
+                bg=c["panel_alt"],
+                fg=c["text_muted"],
+            )
+            self.sidebar.set_item_status("data", "warn", "Import .mat / Demo")
+            if hasattr(self, "fit_empty_banner") and not self.fit_empty_banner.winfo_ismapped():
+                self.fit_empty_banner.pack(fill="x", pady=(0, 8), before=self._fit_body)
 
-        text_holder = tk.Frame(header, bg=COLORS["bg_header"])
-        text_holder.pack(side="left", padx=(4, 6))
-        tk.Label(text_holder, text="Tire Model Optimizer", fg="white", bg=COLORS["bg_header"], font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(14, 0))
-        tk.Label(text_holder, text="Cornering  ·  Drive/Brake  ·  Tire Force Envelope", fg=COLORS["text_muted"], bg=COLORS["bg_header"], font=("Segoe UI", 9)).pack(anchor="w")
-
-        tk.Frame(self, bg=COLORS["accent"], height=3).pack(side="top", fill="x")
-
-    def _build_body(self):
-        body = tk.Frame(self, bg=COLORS["bg"])
-        body.pack(side="top", fill="both", expand=True)
-
-        left = tk.Frame(body, width=490, bg=COLORS["bg"])
-        left.pack(side="left", fill="y", padx=(10, 6), pady=10)
-        left.pack_propagate(False)
-
-        right = tk.Frame(body, bg=COLORS["bg"])
-        right.pack(side="left", fill="both", expand=True, padx=(4, 10), pady=10)
-
-        self._build_notebook_runs(left)
-        self._build_fit_panel(left)
-        self._build_plot_panel(right)
-
-    def _build_notebook_runs(self, parent):
-        self.nb_runs = ttk.Notebook(parent)
-        self.nb_runs.pack(side="top", fill="x", pady=(0, 10))
-
-        tab_corn = ttk.Frame(self.nb_runs, style="Card.TFrame")
-        self.nb_runs.add(tab_corn, text="1A · CORNERING")
-        self._build_cornering_inputs(tab_corn)
-
-        tab_db = ttk.Frame(self.nb_runs, style="Card.TFrame")
-        self.nb_runs.add(tab_db, text="1B · DRIVE / BRAKE")
-        self._build_drivebrake_inputs(tab_db)
-
-        ctrl_frame = ttk.Frame(parent, style="Card.TFrame")
-        ctrl_frame.pack(side="top", fill="x", pady=(0, 10))
-
-        header_row = ttk.Frame(ctrl_frame, style="Card.TFrame")
-        header_row.pack(fill="x", padx=10, pady=(10, 4))
-        ttk.Label(header_row, text="Załadowane run'y", style="Section.TLabel").pack(side="left")
-
-        btn_row = ttk.Frame(ctrl_frame, style="Card.TFrame")
-        btn_row.pack(fill="x", padx=10, pady=(0, 8))
-        ttk.Button(btn_row, text="🗑  Usuń zaznaczone", command=self.remove_selected_runs, style="Danger.TButton").pack(side="left")
-        ttk.Button(btn_row, text="⚙  Przetwórz wszystkie run'y", command=self.process_runs, style="Accent.TButton").pack(side="right")
-
-        self.run_list = ttk.Treeview(
-            ctrl_frame, columns=("type", "file", "fz", "param", "n"), show="headings", height=4, selectmode="extended"
+        lmuy = self.model.get("LMUY", 1.0)
+        surf_lbl = "Asphalt" if lmuy < 0.85 else "Flat-Trac"
+        self.lbl_model_pill.config(
+            text=f"Model: {self._active_model_name} · {surf_lbl} ({lmuy:.2f})",
+            bg=c["cyan_soft"],
+            fg=c["cyan"],
         )
-        for c, txt, w in [
-            ("type", "Typ", 75), ("file", "Plik", 100),
-            ("fz", "Fz±tol", 70), ("param", "Warunki", 175), ("n", "Pkt", 40)
+        self.sidebar.set_item_status("model", "ok", f"{surf_lbl} LMUY={lmuy:.2f}")
+
+        n_fits = len(self.fit_results)
+        if n_fits > 0:
+            self.sidebar.set_item_status("fit", "ok", f"{n_fits} fit(s) ready")
+        elif total > 0:
+            self.sidebar.set_item_status("fit", "warn", "Ready to fit")
+        else:
+            self.sidebar.set_item_status("fit", "idle", "Requires TTC data")
+
+    # ------------------------------------------------------------------
+    # SHELL: HEADER, SIDEBAR, FOOTER
+    # ------------------------------------------------------------------
+    def _build_shell(self):
+        c = self.c
+
+        # Top Header Bar with unified Import... and Export... triggers
+        hdr = tk.Frame(self.root, bg=c["bg_header"], height=54)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+
+        left_h = tk.Frame(hdr, bg=c["bg_header"], padx=14)
+        left_h.pack(side="left", fill="y")
+
+        logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "img", "logo2.png")
+        self._hdr_logo = load_brand_logo(logo_path, max_size=(32, 32))
+        if self._hdr_logo is not None:
+            tk.Label(left_h, image=self._hdr_logo, bg=c["bg_header"]).pack(side="left", padx=(0, 10))
+
+        title_blk = tk.Frame(left_h, bg=c["bg_header"])
+        title_blk.pack(side="left", pady=6)
+        tk.Label(
+            title_blk,
+            text="PUTM TIRE LAB",
+            bg=c["bg_header"],
+            fg=c["text"],
+            font=FONT_DISPLAY,
+            anchor="w",
+        ).pack(anchor="w")
+        tk.Label(
+            title_blk,
+            text="Formula Student Tire Modeling & Telemetry Suite",
+            bg=c["bg_header"],
+            fg=c["text_muted"],
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(anchor="w")
+
+        # Right unified I/O buttons + telemetry status pills
+        right_h = tk.Frame(hdr, bg=c["bg_header"], padx=14)
+        right_h.pack(side="right", fill="y")
+
+        ttk.Button(
+            right_h,
+            text="Export...",
+            style="Accent.TButton",
+            command=self.open_export_dialog,
+        ).pack(side="right", pady=11, padx=(8, 0))
+
+        ttk.Button(
+            right_h,
+            text="Import...",
+            style="Cyan.TButton",
+            command=self.open_import_dialog,
+        ).pack(side="right", pady=11, padx=(12, 0))
+
+        self.lbl_model_pill = tk.Label(
+            right_h,
+            text="Model: --",
+            bg=c["cyan_soft"],
+            fg=c["cyan"],
+            font=FONT_SMALL_BOLD,
+            padx=10,
+            pady=4,
+        )
+        self.lbl_model_pill.pack(side="right", pady=13, padx=(6, 0))
+
+        self.lbl_data_pill = tk.Label(
+            right_h,
+            text="TTC Data: empty",
+            bg=c["panel_alt"],
+            fg=c["text_muted"],
+            font=FONT_SMALL_BOLD,
+            padx=10,
+            pady=4,
+        )
+        self.lbl_data_pill.pack(side="right", pady=13)
+
+        tk.Frame(self.root, bg=c["border"], height=1).pack(fill="x")
+
+        # Main workspace container: Sidebar + Content
+        workspace = tk.Frame(self.root, bg=c["bg"])
+        workspace.pack(fill="both", expand=True)
+
+        self.sidebar = SidebarNav(workspace, on_select=self.switch_tab, width=228, colors=c)
+        self.sidebar.pack(side="left", fill="y")
+
+        self.sidebar.add_section("WORKFLOW")
+        self.sidebar.add_item("data", "01", "Telemetry Data", "Run queue, filters & histograms")
+        self.sidebar.add_item("fit", "02", "Model Fitting", "Autopilot MF 5.1 & curves")
+        self.sidebar.add_item("model", "03", "MF 5.1 Model", "Editor, asphalt, 16x7.5 R20")
+        self.sidebar.add_item("sim3d", "04", "3D & G-G Simulator", "Surfaces, cone, SA/SL grip")
+        self.sidebar.add_item("compare", "05", "Tire Comparator", "Benchmark 1–4 .TIR models")
+
+        self.sidebar.add_section("ANALYSIS TOOLS")
+        self.sidebar.add_item("stiffness", "06", "Cornering Stiffness", "Linear CFa across Fz x IA x P", is_workflow=False)
+        self.sidebar.add_item("sketch", "07", "2D Curve Sketcher", "Magic Formula quick calculator", is_workflow=False)
+
+        self.content_area = tk.Frame(workspace, bg=c["bg"], padx=12, pady=10)
+        self.content_area.pack(side="right", fill="both", expand=True)
+
+        # Bottom Status Bar
+        tk.Frame(self.root, bg=c["border"], height=1).pack(fill="x")
+        footer = tk.Frame(self.root, bg=c["bg_sidebar"], height=26, padx=12)
+        footer.pack(fill="x")
+        footer.pack_propagate(False)
+
+        tk.Label(
+            footer,
+            textvariable=self.var_status,
+            bg=c["bg_sidebar"],
+            fg=c["text_secondary"],
+            font=FONT_SMALL,
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True)
+
+        tk.Label(
+            footer,
+            text="Convention: Fz > 0 [N] | SA [deg] UI / [rad] model | Schema v2",
+            bg=c["bg_sidebar"],
+            fg=c["text_muted"],
+            font=FONT_SMALL,
+            anchor="e",
+        ).pack(side="right")
+
+    def switch_tab(self, key_or_index):
+        """Switch workspace pane by key ('data', 'fit', ...) or numeric index."""
+        if str(key_or_index) == "export":
+            self.open_export_dialog()
+            return
+        if isinstance(key_or_index, int):
+            key = NAV_KEYS[max(0, min(key_or_index, len(NAV_KEYS) - 1))]
+        else:
+            key = str(key_or_index)
+        if key not in self._views:
+            return
+
+        for k, frame in self._views.items():
+            if k == key:
+                frame.pack(fill="both", expand=True)
+            else:
+                frame.pack_forget()
+
+        self._active_key = key
+        self.sidebar.set_active(key)
+
+        if key == "model" and hasattr(self, "mf51_tab"):
+            self.mf51_tab.sync_from_model(redraw=True)
+        elif key == "sim3d" and hasattr(self, "hub_tab"):
+            self.hub_tab.sync_from_model(redraw=True)
+        elif key == "compare" and hasattr(self, "tir_tab"):
+            self.tir_tab.sync_active_model(redraw=True)
+
+    # ------------------------------------------------------------------
+    # UNIFIED IMPORT / EXPORT DIALOGS & GLOBAL ACTIONS
+    # ------------------------------------------------------------------
+    def open_import_dialog(self, initial_mode: str = "telemetry"):
+        UnifiedImportDialog(self.root, self, initial_mode=initial_mode)
+
+    def open_export_dialog(self):
+        UnifiedExportDialog(self.root, self)
+
+    def apply_loaded_tir_model(self, model: MF51Model, tire_name: str, filepath: str = ""):
+        self.model = model
+        self._active_model_name = tire_name or os.path.basename(filepath) or "MF 5.1"
+        self.set_status(f"Loaded active .TIR model: {self._active_model_name}")
+        self.on_model_updated()
+
+    def load_fsae_demo(self):
+        df_c, df_d = generate_fsae_demo_telemetry()
+        self.df_cornering = df_c
+        self.df_drive = df_d
+        self.set_status(f"Loaded FSAE Demo TTC: {len(df_c)} Cornering + {len(df_d)} Drive/Brake samples.")
+        self._refresh_data_kpis()
+        self._draw_histogram()
+        self._update_telemetry_badges()
+
+    def load_tir_global(self):
+        self.open_import_dialog(initial_mode="tir")
+
+    # ------------------------------------------------------------------
+    # STEP 1: TELEMETRY DATA
+    # ------------------------------------------------------------------
+    def _build_step1_data(self):
+        c = self.c
+        view = ttk.Frame(self.content_area)
+        self._views["data"] = view
+
+        StepHeader(
+            view,
+            "STEP 1 / 5",
+            "Telemetry Data Queue (.mat / .csv / .txt)",
+            "Configure condition filters, process loaded telemetry runs, and inspect channel distributions.",
+            badge_kind="accent",
+            next_text="Next: Model Fitting (Step 2) ->",
+            next_command=lambda: self.switch_tab("fit"),
+            colors=c,
+        ).pack(fill="x", pady=(0, 8))
+
+        body = ttk.Frame(view)
+        body.pack(fill="both", expand=True)
+
+        left_wrap = tk.Frame(body, bg=c["bg"], width=425)
+        left_wrap.pack(side="left", fill="y", padx=(0, 10))
+        left_wrap.pack_propagate(False)
+
+        self._data_scroll = ScrollableFrame(left_wrap, bg=c["bg"], padx=2, pady=2)
+        self._data_scroll.pack(fill="both", expand=True)
+        ctrl = self._data_scroll.inner
+
+        # 1. Condition Filter settings
+        card_flt = ModernCard(ctrl, "1. Condition Filter Settings (for Queued Runs)", accent_color=c["accent"], colors=c, pad_x=10, pad_y=8)
+        card_flt.pack(fill="x", pady=(0, 8))
+
+        self._seg_run_type = SegmentedToggle(
+            card_flt.body,
+            self.var_run_type,
+            [("Cornering", "Cornering (Fy / Mz)"), ("Drive/Brake", "Drive/Brake (Fx)")],
+            command=self._on_run_type_toggle,
+            accent_key="accent",
+            colors=c,
+        )
+        self._seg_run_type.pack(fill="x", pady=(0, 8))
+
+        grid_f = tk.Frame(card_flt.body, bg=c["panel"])
+        grid_f.pack(fill="x")
+        grid_f.columnconfigure(1, weight=1)
+        grid_f.columnconfigure(3, weight=1)
+
+        tk.Label(grid_f, text="Fz [N]:", bg=c["panel"], fg=c["text_secondary"], font=FONT_SMALL_BOLD).grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Entry(grid_f, textvariable=self.var_target_fz, width=9).grid(row=0, column=1, sticky="ew", padx=(4, 10), pady=2)
+        tk.Label(grid_f, text="Tol ±:", bg=c["panel"], fg=c["text_secondary"], font=FONT_SMALL).grid(row=0, column=2, sticky="w", pady=2)
+        ttk.Entry(grid_f, textvariable=self.var_tol_fz, width=8).grid(row=0, column=3, sticky="ew", padx=(4, 0), pady=2)
+
+        self.lbl_param_target = tk.Label(grid_f, text="IA [deg]:", bg=c["panel"], fg=c["text_secondary"], font=FONT_SMALL_BOLD)
+        self.lbl_param_target.grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Entry(grid_f, textvariable=self.var_target_param, width=9).grid(row=1, column=1, sticky="ew", padx=(4, 10), pady=2)
+        tk.Label(grid_f, text="Tol ±:", bg=c["panel"], fg=c["text_secondary"], font=FONT_SMALL).grid(row=1, column=2, sticky="w", pady=2)
+        ttk.Entry(grid_f, textvariable=self.var_tol_param, width=8).grid(row=1, column=3, sticky="ew", padx=(4, 0), pady=2)
+
+        self.drive_sa_row = tk.Frame(card_flt.body, bg=c["panel"])
+        tk.Label(self.drive_sa_row, text="Opt. |SA| target:", bg=c["panel"], fg=c["text_muted"], font=FONT_SMALL).pack(side="left")
+        ttk.Entry(self.drive_sa_row, textvariable=self.var_drive_sa, width=7).pack(side="left", padx=(4, 10))
+        tk.Label(self.drive_sa_row, text="Tol ±:", bg=c["panel"], fg=c["text_muted"], font=FONT_SMALL).pack(side="left")
+        ttk.Entry(self.drive_sa_row, textvariable=self.var_drive_sa_tol, width=7).pack(side="left", padx=(4, 0))
+
+        # 2. Run queue
+        card_runs = ModernCard(ctrl, "2. Telemetry File Queue", accent_color=c["cyan"], colors=c, pad_x=10, pad_y=8)
+        card_runs.pack(fill="x", pady=(0, 8))
+
+        self.runs_tree = ttk.Treeview(card_runs.body, columns=("file", "type", "cond", "pts"), show="headings", height=5)
+        for key, title, w, anc in [
+            ("file", "File", 145, "w"),
+            ("type", "Type", 80, "center"),
+            ("cond", "Filter", 110, "center"),
+            ("pts", "Pts", 52, "e"),
         ]:
-            self.run_list.heading(c, text=txt)
-            self.run_list.column(c, width=w, anchor="w")
-        self.run_list.pack(fill="x", padx=10, pady=(2, 10))
+            self.runs_tree.heading(key, text=title)
+            self.runs_tree.column(key, width=w, anchor=anc, stretch=(key == "file"))
+        self.runs_tree.pack(fill="x", pady=(0, 6))
+        style_treeview_zebra(self.runs_tree, c)
 
-    def _form_row(self, parent, r, label, var):
-        ttk.Label(parent, text=label, style="Card.TLabel").grid(row=r, column=0, sticky="w", pady=5, padx=(0, 8))
-        ttk.Entry(parent, textvariable=var, width=10).grid(row=r, column=1, sticky="w")
+        r_btns = tk.Frame(card_runs.body, bg=c["panel"])
+        r_btns.pack(fill="x", pady=(0, 6))
+        ttk.Button(r_btns, text="+ Add Files...", style="Pill.TButton", command=self.add_runs).pack(side="left", padx=(0, 6))
+        ttk.Button(r_btns, text="Remove", style="Pill.TButton", command=self.remove_selected_runs).pack(side="left", padx=(0, 6))
+        ttk.Button(r_btns, text="Clear", style="Pill.TButton", command=self.clear_all_runs).pack(side="left")
 
-    def _build_cornering_inputs(self, parent):
-        form = ttk.Frame(parent, style="Card.TFrame")
-        form.pack(fill="x", padx=14, pady=(14, 6))
+        ttk.Button(card_runs.body, text="Process & Merge Telemetry Data", style="Accent.TButton", command=self.process_runs).pack(fill="x")
 
-        self.c_fz = tk.StringVar(value="1000")
-        self.c_tol_fz = tk.StringVar(value="100")
-        self.c_ia = tk.StringVar(value="0")
-        self.c_tol_ia = tk.StringVar(value="0.25")
+        # 3. Histogram inspector controls
+        card_hist = ModernCard(ctrl, "3. Channel Distribution Inspector", colors=c, pad_x=10, pad_y=8)
+        card_hist.pack(fill="x", pady=(0, 8))
 
-        self._form_row(form, 0, "Środek Fz [N]:", self.c_fz)
-        self._form_row(form, 1, "Tolerancja Fz (± N):", self.c_tol_fz)
-        self._form_row(form, 2, "Środek Camberu IA [deg]:", self.c_ia)
-        self._form_row(form, 3, "Tolerancja IA (± deg):", self.c_tol_ia)
+        tk.Label(card_hist.body, text="Source:", bg=c["panel"], fg=c["text_secondary"], font=FONT_SMALL_BOLD, anchor="w").pack(fill="x")
+        cb_src = ttk.Combobox(card_hist.body, textvariable=self.var_hist_source, values=["Cornering", "Drive/Brake"], state="readonly")
+        cb_src.pack(fill="x", pady=(2, 6))
+        cb_src.bind("<<ComboboxSelected>>", lambda _e: self._draw_histogram())
 
-        ttk.Button(
-            parent, text="＋  Dodaj pliki .mat (Cornering)",
-            command=lambda: self.add_runs("Cornering"), style="Accent.TButton"
-        ).pack(fill="x", padx=14, pady=(6, 14))
+        tk.Label(card_hist.body, text="Channel:", bg=c["panel"], fg=c["text_secondary"], font=FONT_SMALL_BOLD, anchor="w").pack(fill="x")
+        cb_ch = ttk.Combobox(card_hist.body, textvariable=self.var_hist_channel, values=[lbl for _, lbl in HISTOGRAM_CHANNELS], state="readonly")
+        cb_ch.pack(fill="x", pady=(2, 6))
+        cb_ch.bind("<<ComboboxSelected>>", lambda _e: self._draw_histogram())
 
-    def _build_drivebrake_inputs(self, parent):
-        form = ttk.Frame(parent, style="Card.TFrame")
-        form.pack(fill="x", padx=14, pady=(14, 6))
+        ttk.Checkbutton(
+            card_hist.body,
+            text="Focus central 1–99% quantile window",
+            variable=self.var_hist_focus,
+            command=self._draw_histogram,
+        ).pack(anchor="w")
 
-        self.d_fz = tk.StringVar(value="1000")
-        self.d_tol_fz = tk.StringVar(value="100")
-        self.d_sl_max = tk.StringVar(value="0.30")
-        self.d_sa = tk.StringVar(value="0")
-        self.d_tol_sa = tk.StringVar(value="6.5")
-        self.d_ia = tk.StringVar(value="0")
-        self.d_tol_ia = tk.StringVar(value="0.25")
+        # Right panel: KPI Tiles + Histogram plot
+        right = ttk.Frame(body)
+        right.pack(side="right", fill="both", expand=True)
 
-        self._form_row(form, 0, "Środek Fz [N]:", self.d_fz)
-        self._form_row(form, 1, "Tolerancja Fz (± N):", self.d_tol_fz)
-        self._form_row(form, 2, "Maks. |Slip Ratio SL| [-]:", self.d_sl_max)
-        self._form_row(form, 3, "Środek SA [deg]:", self.d_sa)
-        self._form_row(form, 4, "Tolerancja SA (± deg):", self.d_tol_sa)
-        self._form_row(form, 5, "Środek IA [deg]:", self.d_ia)
-        self._form_row(form, 6, "Tolerancja IA (± deg):", self.d_tol_ia)
+        kpi_row = tk.Frame(right, bg=c["bg"])
+        kpi_row.pack(fill="x", pady=(0, 8))
+        for i in range(4):
+            kpi_row.columnconfigure(i, weight=1)
 
-        ttk.Button(
-            parent, text="＋  Dodaj pliki .mat (Drive/Brake)",
-            command=lambda: self.add_runs("Drive/Brake"), style="Accent.TButton"
-        ).pack(fill="x", padx=14, pady=(6, 14))
+        self.tile_d_corn = KpiTile(kpi_row, "CORNERING (FY)", "0 pts", accent=c["accent"], colors=c)
+        self.tile_d_corn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
-    def _build_fit_panel(self, parent):
-        box = ttk.LabelFrame(parent, text="  2)  DOPASOWANIE I EKSPORT  ")
-        box.pack(side="top", fill="both", expand=True, pady=(0, 0))
+        self.tile_d_drive = KpiTile(kpi_row, "DRIVE / BRAKE (FX)", "0 pts", accent=c["cyan"], colors=c)
+        self.tile_d_drive.grid(row=0, column=1, sticky="ew", padx=(0, 6))
 
-        self.fit_btn_text = tk.StringVar(value="📈  Dopasuj model Pacejki Fy0 (Pure Slip)")
-        btn_fit = ttk.Button(box, textvariable=self.fit_btn_text, command=self.fit_model, style="Accent.TButton")
-        btn_fit.pack(fill="x", padx=12, pady=(12, 8))
+        self.tile_d_fz = KpiTile(kpi_row, "FZ RANGE", "--", accent=c["ok"], colors=c)
+        self.tile_d_fz.grid(row=0, column=2, sticky="ew", padx=(0, 6))
 
-        self.txt_results = tk.Text(
-            box, height=8, font=FONT_MONO, state="disabled",
-            bg=COLORS["input"], fg=COLORS["text"], insertbackground=COLORS["text"],
-            relief="flat", padx=10, pady=8, borderwidth=0, highlightthickness=1,
-            highlightbackground=COLORS["border"], highlightcolor=COLORS["accent"]
+        self.tile_d_slip = KpiTile(kpi_row, "SA / SL RANGE", "--", accent=c["purple"], colors=c)
+        self.tile_d_slip.grid(row=0, column=3, sticky="ew")
+
+        hist_card = ModernCard(right, "Histogram & Data Quality Diagnostics", colors=c, pad_x=8, pad_y=6)
+        hist_card.pack(fill="both", expand=True)
+
+        self.lbl_hist_hover = tk.Label(
+            hist_card.body,
+            text="Hover over histogram bars to inspect bin range and sample counts.",
+            bg=c["panel"],
+            fg=c["text_muted"],
+            font=FONT_SMALL,
+            anchor="w",
         )
-        self.txt_results.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        self.lbl_hist_hover.pack(fill="x", pady=(0, 4))
 
-        exp = ttk.Frame(box, style="Card.TFrame")
-        exp.pack(fill="x", padx=12, pady=(0, 12))
-        ttk.Button(exp, text="⬇  Eksport danych (CSV)", command=self.export_data).pack(side="left")
-        ttk.Button(exp, text="⬇  Eksport współczynników", command=self.export_coeffs).pack(side="left", padx=8)
+        self.fig_hist = Figure(figsize=(7.4, 4.6), dpi=100, facecolor=c["panel"])
+        self.canvas_hist = FigureCanvasTkAgg(self.fig_hist, master=hist_card.body)
+        self.canvas_hist.get_tk_widget().configure(bg=c["panel"], highlightthickness=0)
+        self.canvas_hist.get_tk_widget().pack(fill="both", expand=True)
+        self.canvas_hist.mpl_connect("motion_notify_event", self._on_histogram_hover)
+        self._draw_histogram()
 
-    def _build_plot_panel(self, parent):
-        box = ttk.LabelFrame(parent, text="  PODGLĄD WYKRESÓW  ")
-        box.pack(fill="both", expand=True)
-
-        mode_frame = ttk.Frame(box, style="Card.TFrame")
-        mode_frame.pack(fill="x", padx=10, pady=(10, 4))
-
-        ttk.Label(mode_frame, text="Wybierz wykres:", style="Card.TLabel").pack(side="left", padx=(0, 8))
-        self.plot_mode = tk.StringVar(value="Fy (Siła boczna)")
-
-        modes = [
-            "Fy (Siła boczna)", 
-            "Fy (Load Sensitivity)",
-            "Fx (Siła wzdłużna)", 
-            "Mz (Moment stabilizujący)",
-            "Tire Force Envelope",
-            "Combined Slip (Gyk)",
-            HISTOGRAM_MODE,
-        ]
-        self.cb_mode = ttk.Combobox(mode_frame, textvariable=self.plot_mode, values=modes, state="readonly", width=25)
-        self.cb_mode.pack(side="left", padx=4)
-        self.cb_mode.bind("<<ComboboxSelected>>", lambda e: self.on_mode_change())
-
-        ttk.Button(mode_frame, text="⟳  Odśwież", command=self.update_plot_view).pack(side="left", padx=6)
-        ttk.Button(mode_frame, text="✕  Wyczyść", command=self._reset_plot).pack(side="right")
-
-        self.hist_controls = ttk.Frame(box, style="Card.TFrame")
-        self.hist_controls.pack(fill="x", padx=10, pady=(0, 4))
-        self.hist_source = tk.StringVar()
-        self.hist_channel = tk.StringVar(value="Ciśnienie (P)")
-        self.hist_focus = tk.BooleanVar(value=False)
-        self._hist_sources = {}
-        source_row = ttk.Frame(self.hist_controls, style="Card.TFrame")
-        source_row.pack(fill="x", pady=(0, 4))
-        ttk.Label(source_row, text="Dane:", style="Card.TLabel").pack(side="left")
-        self.cb_hist_source = ttk.Combobox(source_row, textvariable=self.hist_source,
-                                            state="readonly", width=42)
-        self.cb_hist_source.pack(side="left", padx=(4, 8))
-        self.cb_hist_source.bind("<<ComboboxSelected>>", lambda e: self.update_plot_view())
-        channel_row = ttk.Frame(self.hist_controls, style="Card.TFrame")
-        channel_row.pack(fill="x")
-        ttk.Label(channel_row, text="Kanał:", style="Card.TLabel").pack(side="left")
-        self.cb_hist_channel = ttk.Combobox(channel_row, textvariable=self.hist_channel,
-                                             state="readonly", width=30)
-        self.cb_hist_channel.pack(side="left", padx=(4, 8))
-        self.cb_hist_channel.bind("<<ComboboxSelected>>", lambda e: self.update_plot_view())
-        ttk.Checkbutton(channel_row, text="Zakres 1–99%", variable=self.hist_focus,
-                        command=self.update_plot_view).pack(side="left")
-        self.hist_summary = tk.StringVar()
-        self.hist_details = tk.StringVar()
-        self.hist_info = ttk.Frame(box, style="Card.TFrame")
-        self.hist_info.pack(fill="x", padx=12)
-        ttk.Label(self.hist_info, textvariable=self.hist_summary, style="Card.TLabel").pack(anchor="w")
-        ttk.Label(self.hist_info, textvariable=self.hist_details, style="Card.TLabel").pack(anchor="w")
-        self._refresh_histogram_sources()
-
-        self.fig = Figure(figsize=(6, 5), dpi=100, facecolor=COLORS["panel"])
-        self.ax = self.fig.add_subplot(111, facecolor=COLORS["panel"])
-        self._cbar = None
-        self._reset_plot()
-
-        canvas_holder = ttk.Frame(box, style="Card.TFrame")
-        self._hist_canvas_holder = canvas_holder
-        canvas_holder.pack(fill="both", expand=True, padx=10, pady=10)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=canvas_holder)
-        self.canvas.get_tk_widget().configure(bg=COLORS["panel"], highlightthickness=0)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
-        self.canvas.mpl_connect("motion_notify_event", self._on_histogram_hover)
-        self._show_histogram_controls(False)
-
-    def _build_statusbar(self):
-        self.status = tk.StringVar(value="Gotowy. Załaduj pliki Cornering lub Drive/Brake.")
-        bar = tk.Frame(self, bg=COLORS["bg_header"], height=28)
-        bar.pack(side="bottom", fill="x")
-        bar.pack_propagate(False)
-        tk.Frame(bar, bg=COLORS["accent"], width=4).pack(side="left", fill="y")
-        tk.Label(bar, textvariable=self.status, anchor="w", bg=COLORS["bg_header"], fg=COLORS["text_muted"], font=("Segoe UI", 9), padx=10).pack(side="left", fill="both", expand=True)
-
-    def _set_status(self, text):
-        self.status.set(text)
-        self.update_idletasks()
-
-    def _style_axes(self):
-        self.ax.set_facecolor(COLORS["panel"])
-        self.fig.patch.set_facecolor(COLORS["panel"])
-        for spine in self.ax.spines.values():
-            spine.set_color(COLORS["border"])
-        self.ax.tick_params(colors=COLORS["text_muted"], labelsize=8)
-        self.ax.title.set_color(COLORS["text"])
-        self.ax.xaxis.label.set_color(COLORS["text_muted"])
-        self.ax.yaxis.label.set_color(COLORS["text_muted"])
-        self.ax.grid(True, color=COLORS["border"], alpha=0.5, linewidth=0.6)
-
-    def _style_colorbar(self, cbar, label):
-        cbar.set_label(label, color=COLORS["text_muted"])
-        cbar.ax.yaxis.set_tick_params(color=COLORS["text_muted"], labelsize=8)
-        cbar.outline.set_edgecolor(COLORS["border"])
-        for t in cbar.ax.get_yticklabels():
-            t.set_color(COLORS["text_muted"])
-
-    def on_mode_change(self):
-        mode = self.plot_mode.get()
-        self._show_histogram_controls(mode == HISTOGRAM_MODE)
-        if mode == "Fy (Siła boczna)":
-            self.fit_btn_text.set("📈  Dopasuj model Fy0 (Pure Slip)")
-        elif mode == "Fy (Load Sensitivity)":
-            self.fit_btn_text.set("📈  Dopasuj model Fy_load (Fz)")
-        elif mode == "Fx (Siła wzdłużna)":
-            self.fit_btn_text.set("📈  Dopasuj model Fx0 (Pure Slip)")
-        elif mode == "Mz (Moment stabilizujący)":
-            self.fit_btn_text.set("📈  Dopasuj model Mz0 (Aligning Torque)")
-        elif mode == "Combined Slip (Gyk)":
-            self.fit_btn_text.set("📈  Dopasuj Combined Slip (Gyk)")
-        elif mode == HISTOGRAM_MODE:
-            self.fit_btn_text.set("📈  Histogram nie wymaga dopasowania")
+    def _on_run_type_toggle(self):
+        rt = self.var_run_type.get()
+        if rt == "Cornering":
+            self.lbl_param_target.config(text="IA [deg]:")
+            self.var_target_param.set("0")
+            self.var_tol_param.set("0.6")
+            self.drive_sa_row.pack_forget()
         else:
-            self.fit_btn_text.set("📈  Brak dopasowania dla obwiedni")
-        self.update_plot_view()
+            self.lbl_param_target.config(text="SL [-]:")
+            self.var_target_param.set("0")
+            self.var_tol_param.set("0.35")
+            self.drive_sa_row.pack(fill="x", pady=(4, 0))
 
-    def _show_histogram_controls(self, visible):
-        if visible:
-            self.hist_controls.pack(fill="x", padx=10, pady=(0, 4), before=self._hist_canvas_holder)
-            self.hist_info.pack(fill="x", padx=12, before=self._hist_canvas_holder)
-        else:
-            self.hist_controls.pack_forget()
-            self.hist_info.pack_forget()
-
-    def _refresh_histogram_sources(self, preferred=None):
-        previous = self._hist_sources.get(self.hist_source.get()) if hasattr(self, "hist_source") else None
-        sources = {}
-        if self.df_cornering is not None and not self.df_cornering.empty:
-            sources["Cornering · po filtrach"] = ("filtered", "Cornering")
-        if self.df_drive is not None and not self.df_drive.empty:
-            sources["Drive/Brake · po filtrach"] = ("filtered", "Drive/Brake")
-        for index, run in enumerate(self.runs):
-            label = f"{index + 1}. {run.test_type} · {os.path.basename(run.filepath)} (cały plik)"
-            sources[label] = ("raw", index)
-        self._hist_sources = sources
-        self.cb_hist_source.configure(values=list(sources))
-        selected = preferred if preferred in sources.values() else previous
-        label = next((name for name, key in sources.items() if key == selected), None)
-        self.hist_source.set(label or next(iter(sources), ""))
-
-    def _histogram_frame(self):
-        selected = self._hist_sources.get(self.hist_source.get())
-        if selected is None:
-            return None
-        scope, identifier = selected
-        if scope == "filtered":
-            return self.df_cornering if identifier == "Cornering" else self.df_drive
-        run = self.runs[identifier]
-        key = (identifier, run.filepath)
-        if key != self._hist_raw_key:
-            self._hist_raw_frame = TireDataManager.load_unfiltered(run)
-            self._hist_raw_key = key
-        return self._hist_raw_frame
-
-    def _draw_histogram(self):
+    def add_runs_from_paths(self, paths: Iterable[str], *, run_type: Optional[str] = None, process_now: bool = False) -> int:
         try:
-            frame = self._histogram_frame()
-        except (OSError, ValueError, KeyError) as exc:
-            self.hist_summary.set(f"Nie można odczytać pliku: {exc}")
-            self.hist_details.set("")
-            self.canvas.draw()
-            return
-        if frame is None or frame.empty:
-            self.hist_summary.set("Dodaj plik .mat, aby zobaczyć rozkład danych.")
-            self.hist_details.set("")
-            self.canvas.draw()
-            return
+            t_fz = float(self.var_target_fz.get().replace(",", "."))
+            tol_fz = float(self.var_tol_fz.get().replace(",", "."))
+            t_p = float(self.var_target_param.get().replace(",", "."))
+            tol_p = float(self.var_tol_param.get().replace(",", "."))
+        except ValueError as exc:
+            messagebox.showerror("Invalid Filter Values", f"Check numeric condition filter entries:\n{exc}")
+            return 0
 
-        available = [label for label, (name, _) in HISTOGRAM_CHANNELS.items()
-                     if name in frame and np.isfinite(pd.to_numeric(frame[name], errors="coerce")).any()]
-        self.cb_hist_channel.configure(values=available)
-        if not available:
-            self.hist_summary.set("Brak kanałów liczbowych z poprawnymi próbkami.")
-            self.hist_details.set("")
-            self.canvas.draw()
-            return
-        if self.hist_channel.get() not in available:
-            self.hist_channel.set(available[0])
-        label = self.hist_channel.get()
-        name, unit = HISTOGRAM_CHANNELS[label]
-        result = make_histogram(pd.to_numeric(frame[name], errors="coerce"), focus=self.hist_focus.get())
-        self._histogram_current = result
-        self._hist_hover_index = None
-
-        edges, counts = result.edges, result.counts
-        self.ax.bar(edges[:-1], counts, width=np.diff(edges) * 0.96, align="edge",
-                    color=COLORS["accent"], edgecolor=COLORS["accent_hover"], linewidth=0.5)
-        self.ax.set_xlim(edges[0], edges[-1])
-        self.ax.set_ylim(0, max(1.2, float(counts.max()) * 1.16))
-        self.ax.yaxis.set_major_locator(MaxNLocator(integer=True, nbins=7))
-        self.ax.xaxis.set_major_locator(MaxNLocator(nbins=8))
-        self.ax.set_xlabel(f"{label} [{unit}]" if unit else label)
-        self.ax.set_ylabel("Liczba próbek")
-        self.ax.set_title(f"Rozkład {name}")
-        if len(counts) <= 16:
-            for left, right, count in zip(edges[:-1], edges[1:], counts):
-                if count:
-                    self.ax.text((left + right) / 2, count, str(count), ha="center", va="bottom",
-                                 fontsize=8, color=COLORS["text"])
-        self._style_axes()
-        self.fig.tight_layout(pad=2)
-        missing = result.total - result.finite
-        grouped = lambda value: f"{value:,}".replace(",", " ")
-        summary = f"Próbki: {grouped(result.finite)}/{grouped(result.total)} · kubełki: {len(counts)}"
-        if missing:
-            summary += f" · brak/∞: {grouped(missing)}"
-        if result.below or result.above:
-            summary += f" · poza widokiem: {grouped(result.below)} poniżej, {grouped(result.above)} powyżej"
-        self.hist_summary.set(summary)
-        self.hist_details.set("Najedź na słupek, aby zobaczyć przedział i dokładną liczbę próbek.")
-        self.canvas.draw()
-
-    def _on_histogram_hover(self, event):
-        result = self._histogram_current
-        if result is None or event.inaxes != self.ax or event.xdata is None:
-            return
-        index = int(np.searchsorted(result.edges, event.xdata, side="right") - 1)
-        if event.xdata == result.edges[-1]:
-            index = len(result.counts) - 1
-        if index < 0 or index >= len(result.counts) or index == self._hist_hover_index:
-            return
-        self._hist_hover_index = index
-        count = int(result.counts[index])
-        percentage = 100 * count / result.finite
-        self.hist_details.set(
-            f"{result.edges[index]:.6g} – {result.edges[index + 1]:.6g}: "
-            f"{count:,}".replace(",", " ") + f" próbek ({percentage:.1f}%)"
-        )
-
-    def _reset_plot(self):
-        self._histogram_current = None
-        if getattr(self, "_cbar", None) is not None:
+        rt = run_type or self.var_run_type.get()
+        t_sa = tol_sa = None
+        if rt == "Drive/Brake":
             try:
-                self._cbar.remove()
-            except Exception:
-                pass
-            self._cbar = None
+                sa_txt = self.var_drive_sa.get().strip()
+                if sa_txt:
+                    t_sa = float(sa_txt.replace(",", "."))
+                    tol_sa = float(self.var_drive_sa_tol.get().replace(",", "."))
+            except ValueError:
+                t_sa = tol_sa = None
 
-        self.ax.clear()
-        legend = self.ax.get_legend()
-        if legend is not None:
-            legend.remove()
+        count = 0
+        for p in paths:
+            self.runs.append(
+                RunConfig(
+                    filepath=p,
+                    test_type=rt,
+                    target_fz=t_fz,
+                    tol_fz=tol_fz,
+                    target_param=t_p,
+                    tol_param=tol_p,
+                    target_sa=t_sa,
+                    tol_sa=tol_sa,
+                )
+            )
+            count += 1
+        self._invalidate_processed_data()
+        self._refresh_run_list()
+        if process_now and count > 0:
+            self.process_runs()
+        elif count > 0:
+            self.set_status(f"Queued {count} telemetry file(s) (click 'Process & Merge Telemetry Data').")
+        return count
 
-        mode = self.plot_mode.get() if hasattr(self, "plot_mode") else "Fy (Siła boczna)"
-
-        # ``Axes.clear()`` does not reliably restore an aspect changed by a
-        # previous view.  The force envelope uses equal X/Y scaling, while all
-        # slip plots combine quantities with very different numerical ranges.
-        self.ax.set_aspect("auto", adjustable="box")
-
-        if mode == HISTOGRAM_MODE:
-            self.ax.set_xlabel("Wartość kanału")
-            self.ax.set_ylabel("Liczba próbek")
-            self.ax.set_title("Rozkład danych")
-        elif "Fy" in mode:
-            self.ax.set_xlabel("Kąt znoszenia SA [deg]")
-            self.ax.set_ylabel("Siła boczna Fy [N]")
-            self.ax.set_title("Pacejka Fy – Siła boczna od kąta znoszenia")
-        elif "Fx" in mode:
-            self.ax.set_xlabel("Poślizg wzdłużny Slip Ratio (SL) [-]")
-            self.ax.set_ylabel("Siła wzdłużna Fx [N]")
-            self.ax.set_title("Charakterystyka wzdłużna (Drive/Brake Fx)")
-        elif "Mz" in mode:
-            self.ax.set_xlabel("Kąt znoszenia SA [deg]")
-            self.ax.set_ylabel("Moment stabilizujący Mz [Nm]")
-            self.ax.set_title("Aligning Torque (Mz0 vs SA)")
-        elif mode == "Combined Slip (Gyk)":
-            self.ax.set_xlabel("Poślizg wzdłużny SL [-]")
-            self.ax.set_ylabel("Współczynnik redukcji Gyk [-]")
-            self.ax.set_title("Combined Slip – zmierzona redukcja Fy")
-        else:
-            self.ax.set_xlabel("Siła wzdłużna Fx [N]")
-            self.ax.set_ylabel("Siła boczna Fy [N]")
-            self.ax.set_title("Tire Force Envelope (Fx vs Fy)")
-            self.ax.set_aspect("equal", adjustable="box")
-
-        if mode != HISTOGRAM_MODE:
-            self.ax.axhline(0, color=COLORS["text_muted"], linewidth=0.8, linestyle="--")
-            self.ax.axvline(0, color=COLORS["text_muted"], linewidth=0.8, linestyle="--")
-        self._style_axes()
-
-        if hasattr(self, "canvas"):
-            self.canvas.draw()
-        if hasattr(self, "status"):
-            self._set_status("Wyczyszczono wykres.")
-
-    # ------------------------------------------------------------ akcje --
-    def add_runs(self, test_type: str):
+    def add_runs(self):
         paths = filedialog.askopenfilenames(
-            title=f"Wybierz pliki .mat dla {test_type}",
-            filetypes=[("MATLAB files", "*.mat"), ("Wszystkie pliki", "*.*")]
+            title="Select Tire Telemetry Files (.mat / .csv / .txt / .dat)",
+            filetypes=[
+                ("Tire Telemetry (*.mat;*.csv;*.txt;*.dat;*.tsv)", "*.mat *.csv *.txt *.dat *.tsv"),
+                ("MATLAB TTC (*.mat)", "*.mat"),
+                ("CSV / ASCII (*.csv;*.txt;*.dat)", "*.csv *.txt *.dat *.tsv"),
+                ("All Files", "*.*"),
+            ],
         )
         if not paths:
             return
-        try:
-            if test_type == "Cornering":
-                fz = float(self.c_fz.get())
-                tol_fz = float(self.c_tol_fz.get())
-                param = float(self.c_ia.get())
-                tol_param = float(self.c_tol_ia.get())
-            else:
-                fz = float(self.d_fz.get())
-                tol_fz = float(self.d_tol_fz.get())
-                param = 0.0
-                tol_param = abs(float(self.d_sl_max.get()))
-                target_sa = float(self.d_sa.get())
-                tol_sa = abs(float(self.d_tol_sa.get()))
-                target_ia = float(self.d_ia.get())
-                tol_ia = abs(float(self.d_tol_ia.get()))
-        except ValueError:
-            messagebox.showerror("Błąd", "Wszystkie pola numeryczne muszą być poprawnymi liczbami.")
-            return
-
-        for path in paths:
-            kwargs = {}
-            if test_type == "Drive/Brake":
-                kwargs = {
-                    "target_sa": target_sa, "tol_sa": tol_sa,
-                    "target_ia": target_ia, "tol_ia": tol_ia,
-                }
-            run = RunConfig(
-                filepath=path, test_type=test_type, target_fz=abs(fz), tol_fz=abs(tol_fz),
-                target_param=param, tol_param=abs(tol_param), **kwargs
-            )
-            self.runs.append(run)
-
-        self._invalidate_processed_data()
-        self._refresh_run_list()
-        self._refresh_histogram_sources(preferred=("raw", len(self.runs) - 1))
-        self.plot_mode.set(HISTOGRAM_MODE)
-        self.on_mode_change()
-        self._set_status(f"Dodano {len(paths)} run'ów [{test_type}].")
+        self.add_runs_from_paths(paths, process_now=False)
 
     def remove_selected_runs(self):
-        sel = self.run_list.selection()
+        sel = self.runs_tree.selection()
         if not sel:
             return
-        indices = sorted([self.run_list.index(item) for item in sel], reverse=True)
+        indices = sorted((int(iid) for iid in sel), reverse=True)
         for idx in indices:
-            del self.runs[idx]
+            if 0 <= idx < len(self.runs):
+                del self.runs[idx]
         self._invalidate_processed_data()
-        self._hist_raw_key = None
-        self._hist_raw_frame = None
         self._refresh_run_list()
-        self._refresh_histogram_sources()
-        if self.plot_mode.get() == HISTOGRAM_MODE:
-            self.update_plot_view()
-        self._set_status(f"Usunięto {len(indices)} run(ów).")
+
+    def clear_all_runs(self):
+        self.runs.clear()
+        self._invalidate_processed_data()
+        self._refresh_run_list()
+        self.set_status("Cleared telemetry run queue.")
 
     def _invalidate_processed_data(self):
         self.df_cornering = None
         self.df_drive = None
-        self.fit_result = None
-        self.fit_results.clear()
-        for run in self.runs:
-            run.n_points = 0
-        self._show_plain_results("Lista runów zmieniła się. Przetwórz je ponownie przed dopasowaniem.")
+        self._refresh_data_kpis()
+        self._draw_histogram()
+        self._update_telemetry_badges()
 
     def _refresh_run_list(self):
-        for item in self.run_list.get_children():
-            self.run_list.delete(item)
-        for r in self.runs:
-            if r.test_type == "Cornering":
-                condition = f"IA {r.target_param:g}±{r.tol_param:g}"
-            else:
-                condition = f"SA {r.target_sa:g}±{r.tol_sa:g}; IA {r.target_ia:g}±{r.tol_ia:g}; |SL|≤{r.tol_param:g}"
-            self.run_list.insert("", "end", values=(
-                r.test_type, os.path.basename(r.filepath),
-                f"{r.target_fz:g}±{r.tol_fz:g}", condition, r.n_points
-            ))
+        for iid in self.runs_tree.get_children():
+            self.runs_tree.delete(iid)
+        for idx, r in enumerate(self.runs):
+            p_lbl = f"IA={r.target_param:g}°" if r.test_type == "Cornering" else f"SL±{r.tol_param:g}"
+            cond = f"Fz={r.target_fz:g}±{r.tol_fz:g}, {p_lbl}"
+            self.runs_tree.insert(
+                "",
+                "end",
+                iid=str(idx),
+                values=(os.path.basename(r.filepath), r.test_type, cond, r.n_points if r.n_points else "--"),
+                tags=("even" if idx % 2 == 0 else "odd",),
+            )
 
     def process_runs(self):
         if not self.runs:
-            messagebox.showwarning("Brak runów", "Dodaj przynajmniej jeden plik .mat.")
+            messagebox.showwarning("Queue Empty", "Add telemetry files via Import... or load the FSAE Demo.")
             return
 
-        corn_frames, drive_frames, errors = [], [], []
-        for run in self.runs:
+        c_frames = []
+        d_frames = []
+        errors = []
+        for r in self.runs:
             try:
-                self._set_status(f"Przetwarzanie {os.path.basename(run.filepath)}...")
-                fdf = TireDataManager.load_and_filter(run)
-                if fdf.empty:
-                    raise ValueError("Brak punktów zgodnych z wybranymi warunkami.")
-                run.n_points = len(fdf)
-                if run.test_type == "Cornering":
-                    corn_frames.append(fdf)
+                df = TireDataManager.load_and_filter(r)
+                r.n_points = len(df)
+                if r.test_type == "Cornering":
+                    c_frames.append(df)
                 else:
-                    drive_frames.append(fdf)
-            except Exception as e:
-                run.n_points = 0
-                errors.append(f"{os.path.basename(run.filepath)}: {e}")
+                    d_frames.append(df)
+            except Exception as exc:
+                errors.append(f"{os.path.basename(r.filepath)}: {exc}")
+
+        self.df_cornering = pd.concat(c_frames, ignore_index=True) if c_frames else None
+        self.df_drive = pd.concat(d_frames, ignore_index=True) if d_frames else None
 
         self._refresh_run_list()
+        self._refresh_data_kpis()
+        self._draw_histogram()
+        self._update_telemetry_badges()
 
-        self.df_cornering = (
-            pd.concat(corn_frames, ignore_index=True).drop_duplicates(["__source_path__", "__row__"], ignore_index=True)
-            if corn_frames else None
-        )
-        self.df_drive = (
-            pd.concat(drive_frames, ignore_index=True).drop_duplicates(["__source_path__", "__row__"], ignore_index=True)
-            if drive_frames else None
-        )
-        self.fit_result = None
-        self.fit_results.clear()
-        preferred_type = self.runs[-1].test_type
-        preferred = ("filtered", preferred_type) if (
-            (preferred_type == "Cornering" and self.df_cornering is not None)
-            or (preferred_type == "Drive/Brake" and self.df_drive is not None)
-        ) else None
-        self._refresh_histogram_sources(preferred=preferred)
-        self._show_plain_results("Dane zmieniły się. Poprzednie wyniki dopasowania zostały unieważnione.")
-
-        total = (len(self.df_cornering) if self.df_cornering is not None else 0) + \
-                (len(self.df_drive) if self.df_drive is not None else 0)
-
-        if total == 0:
-            self._set_status("Nie załadowano żadnych poprawnych punktów.")
-            return messagebox.showerror("Błąd przetwarzania", "\n".join(errors) if errors else "Brak punktów zgodnych z filtrami.")
-
-        self._set_status(f"Załadowano {total} punktów; błędne pliki: {len(errors)}.")
-        self.plot_mode.set(HISTOGRAM_MODE)
-        self.on_mode_change()
         if errors:
-            messagebox.showwarning("Przetworzono z ostrzeżeniami", f"Załadowano punktów: {total}\n\n" + "\n".join(errors))
+            messagebox.showwarning("Processing Warnings", "\n".join(errors[:6]))
+        nc = len(self.df_cornering) if self.df_cornering is not None else 0
+        nd = len(self.df_drive) if self.df_drive is not None else 0
+        self.set_status(f"Processed telemetry: {nc:,} Cornering samples, {nd:,} Drive/Brake samples.")
+
+    def _refresh_data_kpis(self):
+        nc = len(self.df_cornering) if self.df_cornering is not None else 0
+        nd = len(self.df_drive) if self.df_drive is not None else 0
+        self.tile_d_corn.set_value(f"{nc:,} pts")
+        self.tile_d_drive.set_value(f"{nd:,} pts")
+
+        fz_vals = []
+        if self.df_cornering is not None and not self.df_cornering.empty:
+            fz_vals.append(self.df_cornering["FZ"].to_numpy())
+        if self.df_drive is not None and not self.df_drive.empty:
+            fz_vals.append(self.df_drive["FZ"].to_numpy())
+        if fz_vals:
+            all_fz = np.concatenate(fz_vals)
+            self.tile_d_fz.set_value(f"{np.nanmin(all_fz):.0f}–{np.nanmax(all_fz):.0f} N")
         else:
-            messagebox.showinfo("Gotowe", f"Przetworzono pomyślnie. Łącznie punktów: {total}")
+            self.tile_d_fz.set_value("--")
 
-    def update_plot_view(self):
-        mode = self.plot_mode.get()
-        self._reset_plot()
+        slip_parts = []
+        if self.df_cornering is not None and not self.df_cornering.empty and "SA" in self.df_cornering:
+            slip_parts.append(f"SA±{np.nanmax(np.abs(self.df_cornering['SA'])):.1f}°")
+        if self.df_drive is not None and not self.df_drive.empty and "SL" in self.df_drive:
+            slip_parts.append(f"SL±{np.nanmax(np.abs(self.df_drive['SL'])):.2f}")
+        self.tile_d_slip.set_value(" | ".join(slip_parts) if slip_parts else "--")
 
-        if mode == HISTOGRAM_MODE:
-            self._draw_histogram()
+    def _draw_histogram(self):
+        c = self.c
+        self.fig_hist.clear()
+        self.fig_hist.patch.set_facecolor(c["panel"])
+        ax = self.fig_hist.add_subplot(111)
+        self._hist_cache = None
+
+        src = self.var_hist_source.get()
+        df = self.df_cornering if src == "Cornering" else self.df_drive
+        lbl_chosen = self.var_hist_channel.get()
+        ch_code = next((code for code, lbl in HISTOGRAM_CHANNELS if lbl == lbl_chosen), "SA")
+
+        if df is None or df.empty or ch_code not in df.columns:
+            ax.text(0.5, 0.5, f"No processed data for '{src}' ({ch_code})", ha="center", va="center", color=c["text_muted"])
+            style_axes_2d(ax, zero_lines=False, c=c)
+            self.fig_hist.tight_layout(pad=1.4)
+            self.canvas_hist.draw_idle()
             return
 
-        if mode == "Fy (Siła boczna)":
-            if self.df_cornering is None or len(self.df_cornering) == 0:
-                self._set_status("Brak danych Cornering.")
-                return
-            alpha = self.df_cornering["SA"].values
-            fy = -self.df_cornering["FY"].values
-            ia = self.df_cornering["IA"].values
+        h = make_histogram(df[ch_code].to_numpy(), focus=bool(self.var_hist_focus.get()))
+        if h.counts.size == 0:
+            ax.text(0.5, 0.5, "No finite samples in selected channel.", ha="center", va="center", color=c["text_muted"])
+            style_axes_2d(ax, zero_lines=False, c=c)
+            self.fig_hist.tight_layout(pad=1.4)
+            self.canvas_hist.draw_idle()
+            return
 
-            sc = self.ax.scatter(alpha, fy, c=ia, cmap="coolwarm", s=10, alpha=0.75, edgecolors="none")
-            self._cbar = self.fig.colorbar(sc, ax=self.ax, pad=0.02)
-            self._style_colorbar(self._cbar, "Camber IA [deg]")
+        widths = np.diff(h.edges)
+        ax.bar(h.edges[:-1], h.counts, width=widths, align="edge", color=CHART_PALETTE[0], edgecolor=c["panel"], alpha=0.85)
+        self._hist_cache = {"ax": ax, "edges": h.edges, "counts": h.counts, "ch": ch_code}
 
-            self.ax.set_xlim(np.min(alpha) - 1, np.max(alpha) + 1)
-            self.ax.set_ylim(np.min(fy) - 200, np.max(fy) + 200)
+        tail_txt = ""
+        if h.below or h.above:
+            tail_txt = f" | Outside window: -{h.below} / +{h.above}"
+        style_axes_2d(
+            ax,
+            title=f"Distribution: {lbl_chosen} ({src}, n={h.finite:,}{tail_txt})",
+            xlabel=lbl_chosen,
+            ylabel="Sample Count",
+            zero_lines=False,
+            c=c,
+        )
+        self.fig_hist.tight_layout(pad=1.4)
+        self.canvas_hist.draw_idle()
 
-        elif mode == "Fy (Load Sensitivity)":
-            if self.df_cornering is None or len(self.df_cornering) == 0:
-                self._set_status("Brak danych Cornering.")
-                return
-            alpha = self.df_cornering["SA"].values
-            fy = -self.df_cornering["FY"].values
-            fz_abs = np.abs(self.df_cornering["FZ"].values)
+    def _on_histogram_hover(self, event):
+        if not self._hist_cache or event.inaxes is not self._hist_cache["ax"] or event.xdata is None:
+            return
+        edges = self._hist_cache["edges"]
+        counts = self._hist_cache["counts"]
+        x = float(event.xdata)
+        idx = int(np.searchsorted(edges, x, side="right")) - 1
+        if 0 <= idx < len(counts):
+            self.lbl_hist_hover.config(
+                text=f"Channel {self._hist_cache['ch']}: bin [{edges[idx]:.3f}, {edges[idx+1]:.3f}] -> {int(counts[idx]):,} samples",
+                fg=self.c["cyan"],
+            )
 
-            # Kolorowanie względem obciążenia żeby widzieć "warstwy" Fz
-            sc = self.ax.scatter(alpha, fy, c=fz_abs, cmap="viridis", s=10, alpha=0.75, edgecolors="none")
-            self._cbar = self.fig.colorbar(sc, ax=self.ax, pad=0.02)
-            self._style_colorbar(self._cbar, "Obciążenie pionowe Fz [N]")
-            self.ax.set_title("Load Sensitivity – rozkład i przekroje Fz")
+    def _save_histogram_plot(self):
+        path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG", "*.png")], initialfile="PUTM_Histogram_TTC.png")
+        if path:
+            self.fig_hist.savefig(path, dpi=220, facecolor=self.fig_hist.get_facecolor())
+            self.set_status(f"Saved histogram plot: {path}")
 
-            self.ax.set_xlim(np.min(alpha) - 1, np.max(alpha) + 1)
-            self.ax.set_ylim(np.min(fy) - 200, np.max(fy) + 200)
+    # ------------------------------------------------------------------
+    # STEP 2: MODEL FITTING (AUTOPILOT & OPTIMIZER)
+    # ------------------------------------------------------------------
+    def _build_step2_fit(self):
+        c = self.c
+        view = ttk.Frame(self.content_area)
+        self._views["fit"] = view
 
-        elif mode == "Mz (Moment stabilizujący)":
-            if self.df_cornering is None or len(self.df_cornering) == 0:
-                self._set_status("Brak danych Cornering.")
-                return
-            valid = np.isfinite(self.df_cornering["MZ"])
-            if not valid.any():
-                self._set_status("Załadowane dane Cornering nie zawierają kanału MZ.")
-                return
-            alpha = self.df_cornering.loc[valid, "SA"].values
-            mz = self.df_cornering.loc[valid, "MZ"].values
-            fz_abs = np.abs(self.df_cornering.loc[valid, "FZ"].values)
+        StepHeader(
+            view,
+            "STEP 2 / 5",
+            "Model Fitting (Autopilot & Optimizer)",
+            "Extract a complete MF 5.1 tire model in 1 click or fit individual curves with R^2 and NRMSE metrics.",
+            badge_kind="accent",
+            next_text="Apply Fits & Next: Model (Step 3) ->",
+            next_command=self._apply_fit_and_next,
+            colors=c,
+        ).pack(fill="x", pady=(0, 8))
 
-            sc = self.ax.scatter(alpha, mz, c=fz_abs, cmap="viridis", s=10, alpha=0.75, edgecolors="none")
-            self._cbar = self.fig.colorbar(sc, ax=self.ax, pad=0.02)
-            self._style_colorbar(self._cbar, "Obciążenie pionowe Fz [N]")
+        self.fit_empty_banner = StatusBanner(
+            view,
+            "Load telemetry data first (click 'Import...' -> Telemetry / FSAE Demo) to unlock model fitting.",
+            kind="warn",
+            button_text="Open Import...",
+            button_command=lambda: self.open_import_dialog("telemetry"),
+            second_button_text="Load FSAE Demo",
+            second_button_command=self.load_fsae_demo,
+            colors=c,
+        )
 
-            self.ax.set_xlim(np.min(alpha) - 1, np.max(alpha) + 1)
-            self.ax.set_ylim(np.min(mz) - 5, np.max(mz) + 5)
+        self._fit_body = ttk.Frame(view)
+        self._fit_body.pack(fill="both", expand=True)
 
-        elif mode == "Fx (Siła wzdłużna)":
-            if self.df_drive is None or len(self.df_drive) == 0:
-                self._set_status("Brak danych Drive/Brake.")
-                return
-            sl = self.df_drive["SL"].values
-            fx = self.df_drive["FX"].values
-            fz_vals = self.df_drive["FZ"].values
+        left_wrap = tk.Frame(self._fit_body, bg=c["bg"], width=425)
+        left_wrap.pack(side="left", fill="y", padx=(0, 10))
+        left_wrap.pack_propagate(False)
 
-            sc = self.ax.scatter(sl, fx, c=fz_vals, cmap="viridis", s=10, alpha=0.75, edgecolors="none")
-            self._cbar = self.fig.colorbar(sc, ax=self.ax, pad=0.02)
-            self._style_colorbar(self._cbar, "Obciążenie Fz [N]")
+        self._fit_scroll = ScrollableFrame(left_wrap, bg=c["bg"], padx=2, pady=2)
+        self._fit_scroll.pack(fill="both", expand=True)
+        ctrl = self._fit_scroll.inner
 
-            self.ax.set_xlim(np.min(sl) - 0.05, np.max(sl) + 0.05)
-            self.ax.set_ylim(np.min(fx) - 200, np.max(fx) + 200)
+        # 1. Autopilot MF 5.1 Card
+        card_auto = ModernCard(
+            ctrl,
+            "1. Autopilot MF 5.1 (Full 1-Click Extraction)",
+            badge="AUTO",
+            badge_color="cyan",
+            accent_color=c["cyan"],
+            colors=c,
+            pad_x=10,
+            pad_y=8,
+        )
+        card_auto.pack(fill="x", pady=(0, 8))
 
-        elif mode == "Combined Slip (Gyk)":
-            if self.df_drive is None or len(self.df_drive) == 0:
-                self._set_status("Do Combined Slip potrzebne są dane Drive/Brake z kanałami SA, IA i FY.")
-                return
+        tk.Label(
+            card_auto.body,
+            text="Automatically fits Fy(SA, Fz), Fx(SL, Fz), Mz(SA), Camber (IA), and Combined Slip directly into PAC2002.",
+            bg=c["panel"],
+            fg=c["text_muted"],
+            font=FONT_SMALL,
+            wraplength=375,
+            justify="left",
+        ).pack(fill="x", pady=(0, 6))
+
+        p_row = tk.Frame(card_auto.body, bg=c["panel"])
+        p_row.pack(fill="x", pady=(0, 6))
+        tk.Label(p_row, text="Opt. pressure filter [kPa]:", bg=c["panel"], fg=c["text_secondary"], font=FONT_SMALL).pack(side="left")
+        ttk.Entry(p_row, textvariable=self.var_autopilot_p, width=9).pack(side="right")
+
+        self.btn_autopilot = ttk.Button(
+            card_auto.body,
+            text="Run Autopilot MF 5.1 (All Channels)",
+            style="Cyan.TButton",
+            command=self.run_autopilot_step2,
+        )
+        self.btn_autopilot.pack(fill="x", pady=(0, 6))
+
+        self.prog_autopilot = ttk.Progressbar(card_auto.body, mode="indeterminate", style="Horizontal.TProgressbar")
+        self.prog_autopilot.pack(fill="x", pady=(0, 4))
+
+        self.lbl_autopilot_res = tk.Label(
+            card_auto.body,
+            text="Ready — load telemetry data in Step 1 first.",
+            bg=c["panel"],
+            fg=c["text_secondary"],
+            font=FONT_SMALL,
+            wraplength=375,
+            justify="left",
+            anchor="w",
+        )
+        self.lbl_autopilot_res.pack(fill="x")
+
+        # 2. Curve Optimizer Card
+        card_opt = ModernCard(
+            ctrl,
+            "2. Precision Optimizer (Single Model)",
+            badge="FIT",
+            badge_color="accent",
+            accent_color=c["accent"],
+            colors=c,
+            pad_x=10,
+            pad_y=8,
+        )
+        card_opt.pack(fill="x", pady=(0, 8))
+
+        tk.Label(card_opt.body, text="Select model:", bg=c["panel"], fg=c["text_secondary"], font=FONT_SMALL_BOLD, anchor="w").pack(fill="x")
+        cb_m = ttk.Combobox(card_opt.body, textvariable=self.var_fit_model, values=[lbl for _, lbl in FIT_MODELS], state="readonly")
+        cb_m.pack(fill="x", pady=(2, 8))
+
+        opt_grid = tk.Frame(card_opt.body, bg=c["panel"])
+        opt_grid.pack(fill="x", pady=(0, 8))
+        opt_grid.columnconfigure(1, weight=1)
+        opt_grid.columnconfigure(3, weight=1)
+
+        tk.Label(opt_grid, text="Fz Slice [N]:", bg=c["panel"], fg=c["text_muted"], font=FONT_SMALL).grid(row=0, column=0, sticky="w")
+        ttk.Entry(opt_grid, textvariable=self.var_fit_fz_slice, width=8).grid(row=0, column=1, sticky="ew", padx=(4, 10))
+        tk.Label(opt_grid, text="Shape C0:", bg=c["panel"], fg=c["text_muted"], font=FONT_SMALL).grid(row=0, column=2, sticky="w")
+        ttk.Entry(opt_grid, textvariable=self.var_fit_c0, width=7).grid(row=0, column=3, sticky="ew", padx=(4, 0))
+
+        ttk.Button(card_opt.body, text="Fit Selected Model", style="Accent.TButton", command=self.fit_model).pack(fill="x", pady=(0, 5))
+        ttk.Button(card_opt.body, text="Matrix Auto-Fit (Fz x IA x P Grid)...", command=self.open_matrix_autofit).pack(fill="x", pady=(0, 5))
+        ttk.Button(card_opt.body, text="Send Fits -> Step 3 (MF 5.1)", style="Cyan.TButton", command=self.send_fit_to_mf51).pack(fill="x")
+
+        # 3. Saved Fits status card
+        card_saved = ModernCard(ctrl, "3. Session Fits", colors=c, pad_x=10, pad_y=8)
+        card_saved.pack(fill="x", pady=(0, 8))
+
+        self.lbl_saved_fits = tk.Label(
+            card_saved.body,
+            text="No fitted models saved yet.",
+            bg=c["panel"],
+            fg=c["text_muted"],
+            font=FONT_SMALL,
+            wraplength=375,
+            justify="left",
+            anchor="w",
+        )
+        self.lbl_saved_fits.pack(fill="x")
+
+        # Right panel: KPI Tiles + Plot + Parameter Treeview
+        right = ttk.Frame(self._fit_body)
+        right.pack(side="right", fill="both", expand=True)
+
+        kpi_row = tk.Frame(right, bg=c["bg"])
+        kpi_row.pack(fill="x", pady=(0, 8))
+        for i in range(4):
+            kpi_row.columnconfigure(i, weight=1)
+
+        self.tile_fit_r2 = KpiTile(kpi_row, "GOODNESS R^2", "--", accent=c["ok"], colors=c)
+        self.tile_fit_r2.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        self.tile_fit_rmse = KpiTile(kpi_row, "FIT RMSE", "--", accent=c["accent"], colors=c)
+        self.tile_fit_rmse.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+
+        self.tile_fit_nrmse = KpiTile(kpi_row, "NRMSE [%]", "--", accent=c["cyan"], colors=c)
+        self.tile_fit_nrmse.grid(row=0, column=2, sticky="ew", padx=(0, 6))
+
+        self.tile_fit_pts = KpiTile(kpi_row, "MODEL / SAMPLES", "--", accent=c["purple"], colors=c)
+        self.tile_fit_pts.grid(row=0, column=3, sticky="ew")
+
+        plot_card = ModernCard(right, "Measured Data vs Magic Formula Fit", colors=c, pad_x=8, pad_y=6)
+        plot_card.pack(fill="both", expand=True, pady=(0, 8))
+
+        self.fig_fit = Figure(figsize=(7.5, 3.8), dpi=100, facecolor=c["panel"])
+        self.canvas_fit = FigureCanvasTkAgg(self.fig_fit, master=plot_card.body)
+        self.canvas_fit.get_tk_widget().configure(bg=c["panel"], highlightthickness=0)
+        self.canvas_fit.get_tk_widget().pack(fill="both", expand=True)
+
+        param_card = ModernCard(right, "Fitted Model Coefficients", colors=c, pad_x=8, pad_y=6)
+        param_card.pack(fill="x")
+
+        cols = ("param", "val", "unit", "desc")
+        self.tree_fit_params = ttk.Treeview(param_card.body, columns=cols, show="headings", height=5)
+        for key, title, width, anchor in [
+            ("param", "Parameter", 110, "w"),
+            ("val", "Value", 120, "e"),
+            ("unit", "Unit", 110, "center"),
+            ("desc", "Engineering Description", 320, "w"),
+        ]:
+            self.tree_fit_params.heading(key, text=title)
+            self.tree_fit_params.column(key, width=width, anchor=anchor, stretch=(key == "desc"))
+        self.tree_fit_params.pack(fill="x")
+        style_treeview_zebra(self.tree_fit_params, c)
+
+        self._reset_fit_plot()
+
+    def _apply_fit_and_next(self):
+        if self.fit_results:
+            self.send_fit_to_mf51(silent=True)
+        self.switch_tab("model")
+
+    def run_autopilot_step2(self):
+        if self._autopilot_running:
+            return
+        if (self.df_cornering is None or self.df_cornering.empty) and (self.df_drive is None or self.df_drive.empty) and not self.runs:
+            messagebox.showwarning("No Data", "Import telemetry files or load FSAE Demo first.")
+            return
+
+        target_p = None
+        p_txt = self.var_autopilot_p.get().strip()
+        if p_txt:
             try:
-                targets = build_combined_slip_targets(self.df_drive)
-            except ValueError as exc:
-                self._set_status(str(exc))
+                target_p = float(p_txt.replace(",", "."))
+            except ValueError:
+                messagebox.showerror("Invalid Pressure", "Enter pressure in kPa (e.g. 82.7) or leave blank.")
                 return
 
-            sc = self.ax.scatter(
-                targets["SL"], targets["GYK"], c=np.abs(targets["SA"]),
-                cmap="plasma", s=10, alpha=0.65, edgecolors="none"
-            )
-            self._cbar = self.fig.colorbar(sc, ax=self.ax, pad=0.02)
-            self._style_colorbar(self._cbar, "|SA| [deg]")
-            upper_gyk = min(max(float(np.percentile(targets["GYK"], 99)) * 1.1, 1.2), 3.0)
-            self.ax.set_ylim(0.0, upper_gyk)
-            self.ax.set_title("Combined Slip – Gyk z bazą zmierzoną przy SL≈0")
+        self._autopilot_running = True
+        self.btn_autopilot.state(["disabled"])
+        self.prog_autopilot.start(12)
+        self.lbl_autopilot_res.config(text="Running multi-channel MF 5.1 optimization in background...", fg=self.c["cyan"])
 
-        else:  # Tire Force Envelope
-            has_corn = self.df_cornering is not None and len(self.df_cornering) > 0
-            has_drive = self.df_drive is not None and len(self.df_drive) > 0
+        model_copy = self.model.copy()
+        runs_snap = list(self.runs)
+        df_c_snap = self.df_cornering
+        df_d_snap = self.df_drive
 
-            if not has_corn and not has_drive:
-                self._set_status("Brak danych do wykreślenia obwiedni sił opony.")
-                return
+        def worker():
+            try:
+                res = AutoMF51Extractor.extract_from_app_data(
+                    model_copy,
+                    runs_snap,
+                    df_cornering=df_c_snap,
+                    df_drive=df_d_snap,
+                    target_pressure=target_p,
+                )
+                err = None
+            except Exception as exc:
+                res = None
+                err = exc
+            self.root.after(0, lambda: self._on_autopilot_done(model_copy, res, err))
 
-            all_fx, all_fy = [], []
+        threading.Thread(target=worker, daemon=True).start()
 
-            if has_corn:
-                fx_c = np.zeros_like(self.df_cornering["SA"].values)
-                fy_c = -self.df_cornering["FY"].values
-                self.ax.scatter(fx_c, fy_c, color=COLORS["accent"], s=8, alpha=0.65, edgecolors="none", label="Cornering")
-                all_fx.append(fx_c)
-                all_fy.append(fy_c)
+    def _on_autopilot_done(self, fitted_model: MF51Model, res, err):
+        self._autopilot_running = False
+        self.prog_autopilot.stop()
+        self.btn_autopilot.state(["!disabled"])
 
-            if has_drive:
-                fx_d = self.df_drive["FX"].values
-                fy_values = self.df_drive["FY"].values
-                fy_d = np.where(np.isfinite(fy_values), -fy_values, 0.0)
-                self.ax.scatter(fx_d, fy_d, color="#4fb0ff", s=8, alpha=0.65, edgecolors="none", label="Drive/Brake")
-                all_fx.append(fx_d)
-                all_fy.append(fy_d)
-
-            fx_all = np.concatenate(all_fx)
-            fy_all = np.concatenate(all_fy)
-            r_max = float(np.max(np.sqrt(fx_all**2 + fy_all**2))) if len(fx_all) else 1000
-
-            theta = np.linspace(0, 2 * np.pi, 200)
-            for frac in (0.25, 0.5, 0.75, 1.0):
-                r = r_max * frac
-                self.ax.plot(r * np.cos(theta), r * np.sin(theta), color=COLORS["border"], linewidth=0.8, linestyle=":", zorder=0)
-
-            limit = r_max * 1.15
-            self.ax.set_xlim(-limit, limit)
-            self.ax.set_ylim(-limit, limit)
-            self.ax.set_aspect("equal", adjustable="box")
-            self.ax.legend(loc="upper right", facecolor=COLORS["panel_alt"], edgecolor=COLORS["border"], labelcolor=COLORS["text"])
-
-        self._draw_saved_fit(mode)
-        self.canvas.draw()
-        self._set_status(f"Wyświetlono widok: {mode}")
-
-    def _draw_saved_fit(self, mode):
-        model_by_mode = {
-            "Fy (Siła boczna)": "Fy0",
-            "Fy (Load Sensitivity)": "Fy_load",
-            "Fx (Siła wzdłużna)": "Fx0",
-            "Mz (Moment stabilizujący)": "Mz0",
-            "Combined Slip (Gyk)": "CombinedSlip",
-        }
-        result = self.fit_results.get(model_by_mode.get(mode))
-        if result is None:
+        if err is not None:
+            self.lbl_autopilot_res.config(text=f"Autopilot error: {err}", fg=self.c["danger"])
+            messagebox.showerror("Autopilot MF 5.1 Error", str(err))
             return
 
-        if mode == "Fy (Siła boczna)":
-            alpha_deg = np.linspace(float(self.df_cornering["SA"].min()), float(self.df_cornering["SA"].max()), 400)
-            parameters = [result[name] for name in ("B", "C", "D", "E", "Sh", "Sv")]
-            self.ax.plot(alpha_deg, pacejka_fy(np.deg2rad(alpha_deg), *parameters), color="#ffb703", linewidth=3.0, label="Robust fit Fy0")
-        elif mode == "Mz (Moment stabilizujący)":
-            alpha_deg = np.linspace(float(self.df_cornering["SA"].min()), float(self.df_cornering["SA"].max()), 400)
-            parameters = [result[name] for name in ("Bz", "Cz", "Dz", "Ez", "Shz", "Svz")]
-            self.ax.plot(alpha_deg, pacejka_mz(np.deg2rad(alpha_deg), *parameters), color="#ffb703", linewidth=3.0, label="Robust fit Mz0")
-        elif mode == "Fx (Siła wzdłużna)":
-            kappa = np.linspace(float(self.df_drive["SL"].min()), float(self.df_drive["SL"].max()), 400)
-            parameters = [result[name] for name in ("Bx", "Cx", "Dx", "Ex", "Shx", "Svx")]
-            self.ax.plot(kappa, pacejka_fx(kappa, *parameters), color="#ffb703", linewidth=3.0, label="Robust fit Fx0")
-        elif mode == "Combined Slip (Gyk)":
-            kappa = np.linspace(float(self.df_drive["SL"].min()), float(self.df_drive["SL"].max()), 400)
-            self.ax.plot(kappa, pacejka_comb_Gyk(kappa, result["rBy1"], result["rCy1"]), color="#ffb703", linewidth=3.0, label="Robust fit Gyk")
-        else:
-            alpha_deg = np.linspace(float(self.df_cornering["SA"].min()), float(self.df_cornering["SA"].max()), 400)
-            alpha = np.deg2rad(alpha_deg)
-            parameters = [result[name] for name in ("pCy1", "pDy1", "pDy2", "pEy1", "pKy1", "pKy2", "pUy1", "pVy1")]
-            fz_values = [float(self.df_cornering["FZ"].min()), float(self.df_cornering["FZ"].median()), float(self.df_cornering["FZ"].max())]
-            for fz, color in zip(fz_values, ["#3ddc84", "#ffb703", "#e0521c"]):
-                prediction = pacejka_fy_load((alpha, np.full_like(alpha, fz)), *parameters, fz0=result["fz0"])
-                self.ax.plot(alpha_deg, prediction, color=color, linewidth=2.5, label=f"Fit Fz={fz:.0f} N")
-        self.ax.legend(loc="best", facecolor=COLORS["panel_alt"], edgecolor=COLORS["border"], labelcolor=COLORS["text"])
+        if not res.success:
+            self.lbl_autopilot_res.config(text=res.message, fg=self.c["warn"])
+            messagebox.showwarning("Autopilot MF 5.1", res.message)
+            return
 
-    def _show_plain_results(self, text):
-        self.txt_results.configure(state="normal")
-        self.txt_results.delete("1.0", "end")
-        self.txt_results.insert("end", text)
-        self.txt_results.configure(state="disabled")
-
-    def _record_fit(self, result):
-        self.fit_result = result
-        self.fit_results[result["model"]] = result
-
-    def _diagnostic_lines(self, result):
-        lines = [
-            f"RMSE: {result['rmse']:.2f} | NRMSE: {100 * result['nrmse']:.2f}% | R²: {result['r2']:.5f}",
-            f"Bias: {result['bias']:.2f} | Punkty: {result['n_points']} | Wywołania: {result['nfev']}",
-            f"Condition number: {result['condition_number']:.3e}",
-        ]
-        if result.get("warnings"):
-            lines.append("UWAGA: " + "; ".join(result["warnings"]))
-        return lines
-
-    def _fit_pure_model(self, mode):
-        if mode in {"Fy (Siła boczna)", "Mz (Moment stabilizujący)"}:
-            if self.df_cornering is None or len(self.df_cornering) == 0:
-                return messagebox.showwarning("Błąd", "Brak danych Cornering.")
-            frame = self.df_cornering.replace([np.inf, -np.inf], np.nan)
-            x = np.deg2rad(frame["SA"].to_numpy(dtype=float))
-            if mode == "Fy (Siła boczna)":
-                y = -frame["FY"].to_numpy(dtype=float)
-                model_name, title = "Fy0", "Fy0 – Pure Slip"
-            else:
-                y = frame["MZ"].to_numpy(dtype=float)
-                model_name, title = "Mz0", "Mz0 – Aligning Moment"
-            slip_unit = "rad"
-        else:
-            if self.df_drive is None or len(self.df_drive) == 0:
-                return messagebox.showwarning("Błąd", "Brak danych Drive/Brake.")
-            frame = self.df_drive.replace([np.inf, -np.inf], np.nan)
-            if "SA" in frame and frame["SA"].notna().any():
-                pure_mask = np.abs(frame["SA"]) <= 0.30
-                frame = frame[pure_mask]
-            if len(frame) < 12:
-                return messagebox.showwarning("Błąd", "Za mało danych Pure Fx przy |SA| ≤ 0.30°.")
-            x = frame["SL"].to_numpy(dtype=float)
-            y = frame["FX"].to_numpy(dtype=float)
-            model_name, title, slip_unit = "Fx0", "Fx0 – Pure Slip", "ratio"
-
-        try:
-            output = fit_pure_magic(x, y, model_name=model_name, slip_unit=slip_unit)
-        except Exception as exc:
-            return messagebox.showerror("Błąd optymalizacji", str(exc))
-
-        generic = output.as_dict()
-        if model_name == "Fy0":
-            result = generic
-            parameter_line = (
-                f"B={result['B']:.5g}  C={result['C']:.4g} (fixed)  D={result['D']:.2f} N\n"
-                f"E={result['E']:.5g}  Sh={np.rad2deg(result['Sh']):.4f}°  Sv={result['Sv']:.2f} N"
+        self.model = fitted_model
+        self._active_model_name = "Autopilot MF 5.1 (TTC)"
+        n_p = len(res.parameters)
+        msg_short = f"✓ Done ({n_p} MF 5.1 params): PDY1={fitted_model.get('PDY1'):.3f}, PDY2={fitted_model.get('PDY2'):.3f}, PDX1={fitted_model.get('PDX1'):.3f}"
+        self.lbl_autopilot_res.config(text=msg_short, fg=self.c["ok"])
+        if hasattr(self, "mf51_tab"):
+            self.mf51_tab._set_info(
+                "--- AUTOMATED MULTI-FZ EXTRACTION REPORT (MF 5.1) ---\n" + "\n".join(res.diagnostics_log)
             )
-        elif model_name == "Fx0":
-            diagnostics = {key: value for key, value in generic.items() if key not in {"B", "C", "D", "E", "Sh", "Sv"}}
-            result = {
-                **diagnostics,
-                "Bx": generic["B"], "Cx": generic["C"], "Dx": generic["D"],
-                "Ex": generic["E"], "Shx": generic["Sh"], "Svx": generic["Sv"],
-            }
-            parameter_line = (
-                f"Bx={result['Bx']:.5g}  Cx={result['Cx']:.4g} (fixed)  Dx={result['Dx']:.2f} N\n"
-                f"Ex={result['Ex']:.5g}  Shx={result['Shx']:.6f}  Svx={result['Svx']:.2f} N"
-            )
-        else:
-            diagnostics = {key: value for key, value in generic.items() if key not in {"B", "C", "D", "E", "Sh", "Sv"}}
-            result = {
-                **diagnostics,
-                "Bz": generic["B"], "Cz": generic["C"], "Dz": generic["D"],
-                "Ez": generic["E"], "Shz": generic["Sh"], "Svz": generic["Sv"],
-            }
-            parameter_line = (
-                f"Bz={result['Bz']:.5g}  Cz={result['Cz']:.4g} (fixed)  Dz={result['Dz']:.3f} Nm\n"
-                f"Ez={result['Ez']:.5g}  Shz={np.rad2deg(result['Shz']):.4f}°  Svz={result['Svz']:.3f} Nm"
-            )
+        self.set_status(msg_short)
+        self.on_model_updated()
 
-        result["schema_version"] = 2
-        self._record_fit(result)
-        self._show_plain_results("\n".join([title, parameter_line, *self._diagnostic_lines(result)]))
-        self.update_plot_view()
-        self._set_status(f"Dopasowano {model_name}; NRMSE={100 * result['nrmse']:.2f}%")
-
-    def _fit_combined_model(self):
-        if self.df_drive is None or len(self.df_drive) == 0:
-            return messagebox.showwarning("Błąd", "Brak danych Drive/Brake.")
-        try:
-            output = fit_combined_slip(self.df_drive)
-        except Exception as exc:
-            return messagebox.showerror("Błąd optymalizacji Combined Slip", str(exc))
-        result = {**output.as_dict(), "schema_version": 2}
-        self._record_fit(result)
-        parameters = f"rBy1={result['rBy1']:.5g}  rCy1={result['rCy1']:.5g}\nGrupy warunków: {result['n_condition_groups']}"
-        self._show_plain_results("\n".join(["Combined Slip – Gyk", parameters, *self._diagnostic_lines(result)]))
-        self.update_plot_view()
-        self._set_status(f"Dopasowano Combined Slip; NRMSE={100 * result['nrmse']:.2f}%")
-
-    def _fit_load_model(self):
-        if self.df_cornering is None or len(self.df_cornering) == 0:
-            return messagebox.showwarning("Błąd", "Brak danych Cornering.")
-
-        df = self.df_cornering.replace([np.inf, -np.inf], np.nan).dropna(subset=["SA", "FY", "FZ"])
-        configured_loads = df["__target_fz__"].nunique() if "__target_fz__" in df else 0
-        if configured_loads < 3:
-            return messagebox.showwarning(
-                "Błąd",
-                "Fit load-sensitive wymaga danych dodanych dla co najmniej trzech docelowych poziomów Fz.",
-            )
-        alpha = np.deg2rad(df["SA"].to_numpy(dtype=float))
-        fy = -df["FY"].to_numpy(dtype=float)
-        fz_abs = np.abs(df["FZ"].to_numpy(dtype=float))
-        try:
-            output = fit_load_sensitive(alpha, fz_abs, fy)
-        except Exception as exc:
-            return messagebox.showerror("Błąd optymalizacji", str(exc))
-        result = {**output.as_dict(), "schema_version": 2}
-        self._record_fit(result)
-        parameter_lines = [
-            "Fy Load Sensitivity",
-            f"pCy1={result['pCy1']:.5g}  pDy1={result['pDy1']:.5g}  pDy2={result['pDy2']:.5g}",
-            f"pEy1={result['pEy1']:.5g}  pKy1={result['pKy1']:.5g}  pKy2={result['pKy2']:.5g}",
-            f"pUy1={result['pUy1']:.5g} rad  pVy1={result['pVy1']:.5g}  Fz0={result['fz0']:.1f} N",
-            f"Poziomy Fz (100 N): {result['n_load_levels_100N']}",
-        ]
-        self._show_plain_results("\n".join([*parameter_lines, *self._diagnostic_lines(result)]))
-        self.update_plot_view()
-        self._set_status(f"Dopasowano Fy_load; NRMSE={100 * result['nrmse']:.2f}%")
+    def _selected_fit_code(self) -> str:
+        lbl = self.var_fit_model.get()
+        return next((code for code, name in FIT_MODELS if name == lbl), "Fy0")
 
     def fit_model(self):
-        mode = self.plot_mode.get()
-        if mode in {"Fy (Siła boczna)", "Fx (Siła wzdłużna)", "Mz (Moment stabilizujący)"}:
-            return self._fit_pure_model(mode)
-        if mode == "Fy (Load Sensitivity)":
-            return self._fit_load_model()
-        if mode == "Combined Slip (Gyk)":
-            return self._fit_combined_model()
-        messagebox.showinfo("Info", "Ten widok nie ma modelu do dopasowania.")
+        code = self._selected_fit_code()
+        fz_txt = self.var_fit_fz_slice.get().strip()
+        fz_filter = None
+        if fz_txt:
+            try:
+                fz_filter = float(fz_txt.replace(",", "."))
+            except ValueError:
+                messagebox.showerror("Invalid Fz Slice", "Enter numeric Fz load in N or leave blank.")
+                return
 
-    def export_data(self):
-        if self.df_cornering is None and self.df_drive is None:
-            return messagebox.showwarning("Brak danych", "Brak danych do eksportu.")
-        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+        try:
+            c0 = float(self.var_fit_c0.get().replace(",", "."))
+        except ValueError:
+            c0 = 1.30
+
+        try:
+            if code in ("Fy0", "Mz0"):
+                out = self._fit_pure_model(code, fz_filter, c0)
+            elif code == "Fy_load":
+                out = self._fit_load_model()
+            elif code == "Fx0":
+                out = self._fit_pure_model("Fx0", fz_filter, c0)
+            elif code == "CombinedSlip":
+                out = self._fit_combined_model()
+            elif code == "Mu_Fz":
+                out = self._fit_mu_vs_fz()
+            else:
+                out = self._fit_envelope()
+        except Exception as exc:
+            messagebox.showerror("Fitting Error", str(exc))
+            return
+
+        if out is not None:
+            self.set_status(f"Fitted {code} model (R^2={out.get('r2', 0.0):.4f}).")
+            self._update_telemetry_badges()
+
+    def _slice_df(self, df: Optional[pd.DataFrame], fz_filter: Optional[float]) -> pd.DataFrame:
+        if df is None or df.empty:
+            raise ValueError("No telemetry data loaded — import files or load FSAE Demo first.")
+        if fz_filter is None:
+            return df
+        sub = df[np.abs(df["FZ"] - fz_filter) <= 150.0]
+        if len(sub) < 20:
+            raise ValueError(f"Insufficient points near Fz={fz_filter:.0f} N ({len(sub)} pts).")
+        return sub
+
+    def _fit_pure_model(self, code: str, fz_filter: Optional[float], c0: float) -> dict:
+        if code == "Fx0":
+            df = self._slice_df(self.df_drive, fz_filter)
+            x_raw = df["SL"].to_numpy(dtype=float)
+            y_raw = df["FX"].to_numpy(dtype=float)
+            out = fit_pure_magic(x_raw, y_raw, model_name="Fx0", slip_unit="ratio", shape_factor=c0)
+            x_plot, x_label, y_label = x_raw, "Slip Ratio SL [-]", "Fx [N]"
+        elif code == "Mz0":
+            df = self._slice_df(self.df_cornering, fz_filter)
+            x_deg = df["SA"].to_numpy(dtype=float)
+            y_raw = df["MZ"].to_numpy(dtype=float)
+            out = fit_pure_magic(np.radians(x_deg), y_raw, model_name="Mz0", slip_unit="rad", shape_factor=c0)
+            x_plot, x_label, y_label = x_deg, "SA [deg]", "Mz [Nm]"
+        else:
+            df = self._slice_df(self.df_cornering, fz_filter)
+            x_deg = df["SA"].to_numpy(dtype=float)
+            y_raw = -df["FY"].to_numpy(dtype=float)
+            out = fit_pure_magic(np.radians(x_deg), y_raw, model_name="Fy0", slip_unit="rad", shape_factor=c0)
+            x_plot, x_label, y_label = x_deg, "SA [deg]", "Fy [N]"
+
+        record = {
+            "model": code,
+            "parameters": dict(out.parameters),
+            **{k: float(v) for k, v in out.parameters.items() if isinstance(v, (int, float))},
+            "r2": float(out.diagnostics.get("r2", 0.0)),
+            "rmse": float(out.diagnostics.get("rmse", 0.0)),
+            "nrmse": 100.0 * float(out.diagnostics.get("nrmse", 0.0)),
+            "n_points": int(out.diagnostics.get("n_points", len(out.y))),
+            "x_plot": x_plot,
+            "y_meas": out.y,
+            "y_pred": out.prediction,
+            "x_label": x_label,
+            "y_label": y_label,
+        }
+        self._record_fit(code, record)
+        return record
+
+    def _fit_load_model(self) -> dict:
+        df = self._slice_df(self.df_cornering, None)
+        alpha = np.radians(df["SA"].to_numpy(dtype=float))
+        fz = df["FZ"].to_numpy(dtype=float)
+        force = -df["FY"].to_numpy(dtype=float)
+        out = fit_load_sensitive(alpha, fz, force)
+        record = {
+            "model": "Fy_load",
+            "parameters": {k: v for k, v in out.parameters.items() if k != "model"},
+            **{k: float(v) for k, v in out.parameters.items() if isinstance(v, (int, float))},
+            "r2": float(out.diagnostics.get("r2", 0.0)),
+            "rmse": float(out.diagnostics.get("rmse", 0.0)),
+            "nrmse": 100.0 * float(out.diagnostics.get("nrmse", 0.0)),
+            "n_points": int(out.diagnostics.get("n_points", len(out.y))),
+            "x_plot": df["SA"].to_numpy(dtype=float),
+            "fz_plot": fz,
+            "y_meas": out.y,
+            "y_pred": out.prediction,
+            "x_label": "SA [deg]",
+            "y_label": "Fy [N]",
+        }
+        self._record_fit("Fy_load", record)
+        return record
+
+    def _fit_combined_model(self) -> dict:
+        df = self._slice_df(self.df_drive, None)
+        out = fit_combined_slip(df)
+        record = {
+            "model": "CombinedSlip",
+            "parameters": {k: v for k, v in out.parameters.items() if k != "model"},
+            **{k: float(v) for k, v in out.parameters.items() if isinstance(v, (int, float))},
+            "r2": float(out.diagnostics.get("r2", 0.0)),
+            "rmse": float(out.diagnostics.get("rmse", 0.0)),
+            "nrmse": 100.0 * float(out.diagnostics.get("nrmse", 0.0)),
+            "n_points": int(out.diagnostics.get("n_points", len(out.y))),
+            "x_plot": out.x,
+            "y_meas": out.y,
+            "y_pred": out.prediction,
+            "x_label": "Slip Ratio SL [-]",
+            "y_label": "Reduction Factor Gyk [-]",
+        }
+        self._record_fit("CombinedSlip", record)
+        return record
+
+    def _fit_mu_vs_fz(self) -> dict:
+        df_c = self._slice_df(self.df_cornering, None)
+        fz_levels = np.unique(np.round(df_c["FZ"] / 150.0) * 150.0)
+        pts_y = []
+        for fz_c in fz_levels:
+            sub = df_c[np.abs(df_c["FZ"] - fz_c) <= 120.0]
+            if len(sub) >= 15:
+                mu_y = float(np.percentile(np.abs(sub["FY"]), 98) / max(np.median(sub["FZ"]), 1.0))
+                pts_y.append((float(np.median(sub["FZ"])), mu_y))
+        if len(pts_y) < 2:
+            raise ValueError("At least 2 distinct Fz levels are required to fit Mu_Fz.")
+        fz_arr = np.array([p[0] for p in pts_y])
+        mu_arr = np.array([p[1] for p in pts_y])
+        fz0 = float(np.median(fz_arr))
+        dfz = (fz_arr - fz0) / fz0
+        pdy2, pdy1 = np.polyfit(dfz, mu_arr, 1)
+
+        pdx1, pdx2 = float(pdy1 * 1.06), float(pdy2)
+        if self.df_drive is not None and not self.df_drive.empty:
+            pts_x = []
+            for fz_d in np.unique(np.round(self.df_drive["FZ"] / 150.0) * 150.0):
+                sub_d = self.df_drive[np.abs(self.df_drive["FZ"] - fz_d) <= 120.0]
+                if len(sub_d) >= 15:
+                    pts_x.append((float(np.median(sub_d["FZ"])), float(np.percentile(np.abs(sub_d["FX"]), 98) / max(np.median(sub_d["FZ"]), 1.0))))
+            if len(pts_x) >= 2:
+                fxd = (np.array([p[0] for p in pts_x]) - fz0) / fz0
+                pdx2, pdx1 = np.polyfit(fxd, np.array([p[1] for p in pts_x]), 1)
+
+        pred = pdy1 + pdy2 * dfz
+        ss_res = float(np.sum((mu_arr - pred) ** 2))
+        ss_tot = float(np.sum((mu_arr - np.mean(mu_arr)) ** 2))
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 1.0
+        rmse = float(np.sqrt(np.mean((mu_arr - pred) ** 2)))
+
+        params = {"pDy1": float(pdy1), "pDy2": float(pdy2), "pDx1": float(pdx1), "pDx2": float(pdx2), "fz0": fz0}
+        record = {
+            "model": "mu_vs_fz",
+            "parameters": params,
+            **params,
+            "r2": r2,
+            "rmse": rmse,
+            "nrmse": 100.0 * rmse / max(float(np.mean(mu_arr)), 1e-6),
+            "n_points": len(pts_y),
+            "x_plot": fz_arr,
+            "y_meas": mu_arr,
+            "y_pred": pred,
+            "x_label": "Fz [N]",
+            "y_label": "Peak mu_y [-]",
+        }
+        self._record_fit("mu_vs_fz", record)
+        return record
+
+    def _fit_envelope(self) -> dict:
+        df_c = self._slice_df(self.df_cornering, None)
+        fy_peak = float(np.percentile(np.abs(df_c["FY"]), 99))
+        fz_med = float(np.median(df_c["FZ"]))
+        fx_peak = float(np.percentile(np.abs(self.df_drive["FX"]), 99)) if self.df_drive is not None and not self.df_drive.empty else fy_peak * 1.05
+        th = np.linspace(0, 2 * np.pi, 180)
+        fy_e = fy_peak * np.sin(th)
+        fx_e = fx_peak * np.cos(th)
+        params = {"Fy_peak": fy_peak, "Fx_peak": fx_peak, "Fz_med": fz_med, "mu_y": fy_peak / max(fz_med, 1.0), "mu_x": fx_peak / max(fz_med, 1.0)}
+        record = {
+            "model": "Envelope",
+            "parameters": params,
+            **params,
+            "r2": 1.0,
+            "rmse": 0.0,
+            "nrmse": 0.0,
+            "n_points": len(df_c),
+            "x_plot": fy_e,
+            "y_meas": fx_e,
+            "y_pred": fx_e,
+            "x_label": "Fy [N]",
+            "y_label": "Fx [N]",
+        }
+        self._record_fit("Envelope", record)
+        return record
+
+    def _record_fit(self, key: str, record: dict):
+        self.fit_results[key] = record
+        self.fit_result = record
+        self._display_fit_kpis(record)
+        self._draw_saved_fit(record)
+        self.lbl_saved_fits.config(
+            text="Saved models: " + ", ".join(self.fit_results.keys()),
+            fg=self.c["cyan"],
+        )
+
+    def _display_fit_kpis(self, record: dict):
+        r2 = record.get("r2", 0.0)
+        rmse = record.get("rmse", 0.0)
+        nrmse = record.get("nrmse", 0.0)
+        self.tile_fit_r2.set_value(f"{r2:.4f}", self.c["ok"] if r2 >= 0.90 else self.c["warn"])
+        self.tile_fit_rmse.set_value(f"{rmse:.2f}")
+        self.tile_fit_nrmse.set_value(f"{nrmse:.2f}%")
+        self.tile_fit_pts.set_value(f"{record.get('model')} ({record.get('n_points', 0)})")
+
+        for iid in self.tree_fit_params.get_children():
+            self.tree_fit_params.delete(iid)
+        params = record.get("parameters", {})
+        for idx, (k, v) in enumerate(params.items()):
+            if not isinstance(v, (int, float)):
+                continue
+            unit, desc = PARAM_DESCRIPTIONS.get(k, ("-", "Fitted parameter"))
+            self.tree_fit_params.insert(
+                "",
+                "end",
+                values=(k, f"{float(v):.5g}", unit, desc),
+                tags=("even" if idx % 2 == 0 else "odd",),
+            )
+
+    def _reset_fit_plot(self):
+        c = self.c
+        self.fig_fit.clear()
+        self.fig_fit.patch.set_facecolor(c["panel"])
+        ax = self.fig_fit.add_subplot(111)
+        ax.text(0.5, 0.5, "Choose a model on the left and click 'Fit Selected Model'\nor launch 'Run Autopilot MF 5.1 (All Channels)'", ha="center", va="center", color=c["text_muted"])
+        style_axes_2d(ax, zero_lines=False, c=c)
+        self.fig_fit.tight_layout(pad=1.4)
+        self.canvas_fit.draw_idle()
+
+    def _draw_saved_fit(self, record: dict):
+        c = self.c
+        self.fig_fit.clear()
+        self.fig_fit.patch.set_facecolor(c["panel"])
+        ax = self.fig_fit.add_subplot(111)
+
+        xp = np.asarray(record["x_plot"])
+        ym = np.asarray(record["y_meas"])
+        yp = np.asarray(record["y_pred"])
+        mname = record["model"]
+
+        if mname == "Envelope":
+            ax.plot(xp, yp, color=CHART_PALETTE[0], linewidth=2.4, label="G-G Envelope")
+            ax.set_aspect("equal", adjustable="datalim")
+        else:
+            step = max(1, len(xp) // 900)
+            ax.scatter(xp[::step], ym[::step], color=c["cyan"], s=14, alpha=0.40, label="TTC Telemetry")
+            order = np.argsort(xp)
+            if mname == "Fy_load":
+                fz_arr = np.asarray(record.get("fz_plot", []))
+                if fz_arr.size == len(xp):
+                    levels = np.unique(np.round(fz_arr / 150.0) * 150.0)
+                    for idx, lv in enumerate(levels[:5]):
+                        mask = np.abs(fz_arr - lv) <= 120.0
+                        if mask.any():
+                            ord_l = np.argsort(xp[mask])
+                            ax.plot(xp[mask][ord_l], yp[mask][ord_l], color=CHART_PALETTE[idx % len(CHART_PALETTE)], linewidth=2.1, label=f"Fit Fz~{lv:.0f}N")
+                else:
+                    ax.scatter(xp, yp, color=c["accent"], s=10, label="Prediction")
+            else:
+                ax.plot(xp[order], yp[order], color=c["accent"], linewidth=2.4, label=f"Fit {mname} (R^2={record.get('r2', 0):.3f})")
+
+        style_axes_2d(ax, title=f"Fit {mname} | R^2={record.get('r2', 0):.4f} | RMSE={record.get('rmse', 0):.2f}", xlabel=record.get("x_label", "X"), ylabel=record.get("y_label", "Y"), c=c)
+        style_legend(ax, c=c)
+        self.fig_fit.tight_layout(pad=1.4)
+        self.canvas_fit.draw_idle()
+
+    def send_fit_to_mf51(self, silent: bool = False):
+        if not self.fit_results:
+            if not silent:
+                messagebox.showinfo("No Fits", "Fit at least one model in Step 2 first.")
+            return
+        payload = dict(self.fit_results)
+        if "CombinedSlip" in payload and "Combined" not in payload:
+            payload["Combined"] = payload["CombinedSlip"]
+        if "Fx0" in payload:
+            fx_rec = dict(payload["Fx0"])
+            fx_p = dict(fx_rec.get("parameters", fx_rec))
+            for src, dst in (("Bx", "B"), ("Cx", "C"), ("Dx", "D"), ("Ex", "E"), ("Shx", "Sh"), ("Svx", "Sv")):
+                if src in fx_p and dst not in fx_p:
+                    fx_p[dst] = fx_p[src]
+            fx_rec["parameters"] = fx_p
+            payload["Fx0"] = fx_rec
+        imported = self.model.import_from_fit_results(payload)
+        self._active_model_name = "Fit -> MF 5.1 Model"
+        self.on_model_updated()
+        if not silent:
+            messagebox.showinfo("Synced to Step 3", "Imported parameters into active MF 5.1 model:\n" + "\n".join(imported))
+        self.set_status("Updated MF 5.1 model from Step 2 fit results.")
+
+    def open_matrix_autofit(self):
+        def _on_apply(target, fit_dict):
+            key = target
+            self.fit_results[key] = fit_dict
+            self.fit_result = fit_dict
+            self._display_fit_kpis(fit_dict)
+            self._update_telemetry_badges()
+
+        MatrixAutoFitDialog(self.root, self.runs, raw_cache=self.raw_cache, on_fit_selected=_on_apply, colors=self.c)
+
+    def save_current_plot(self):
+        path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG", "*.png")], initialfile="PUTM_Fit_Plot.png")
+        if path:
+            self.fig_fit.savefig(path, dpi=220, facecolor=self.fig_fit.get_facecolor())
+            self.set_status(f"Saved fit plot: {path}")
+
+    # ------------------------------------------------------------------
+    # STEPS 3 - 7
+    # ------------------------------------------------------------------
+    def _build_step3_model(self):
+        view = ttk.Frame(self.content_area)
+        self._views["model"] = view
+        self.mf51_tab = MF51Tab(
+            view,
+            colors=self.c,
+            set_status=self.set_status,
+            get_fit_results=lambda: self.fit_results,
+            get_runs=lambda: self.runs,
+            get_df_cornering=lambda: self.df_cornering,
+            get_df_drive=lambda: self.df_drive,
+            get_model=self.get_model,
+            set_model=self.set_model,
+            on_model_updated=self.on_model_updated,
+            on_next_step=lambda: self.switch_tab("sim3d"),
+            show_step_header=True,
+        )
+        self.mf51_tab.pack(fill="both", expand=True)
+
+    def _build_step4_sim3d(self):
+        view = ttk.Frame(self.content_area)
+        self._views["sim3d"] = view
+        self.hub_tab = HubTab(
+            view,
+            colors=self.c,
+            set_status=self.set_status,
+            get_model=self.get_model,
+            set_model=self.set_model,
+            on_model_updated=self.on_model_updated,
+            get_df_cornering=lambda: self.df_cornering,
+            get_df_drive=lambda: self.df_drive,
+            get_runs=lambda: self.runs,
+            on_data_loaded=self._on_demo_loaded_from_hub,
+            on_edit_model=lambda: self.switch_tab("model"),
+            on_next_step=lambda: self.switch_tab("compare"),
+            show_step_header=True,
+        )
+        self.hub_tab.pack(fill="both", expand=True)
+
+    def _on_demo_loaded_from_hub(self, df_c: pd.DataFrame, df_d: pd.DataFrame):
+        self.df_cornering = df_c
+        self.df_drive = df_d
+        self._refresh_data_kpis()
+        self._draw_histogram()
+        self._update_telemetry_badges()
+
+    def _build_step5_compare(self):
+        view = ttk.Frame(self.content_area)
+        self._views["compare"] = view
+        self.tir_tab = TirAnalyzerTab(
+            view,
+            colors=self.c,
+            set_status=self.set_status,
+            get_active_model=self.get_model,
+            on_next_step=lambda: self.switch_tab("stiffness"),
+            show_step_header=True,
+        )
+        self.tir_tab.pack(fill="both", expand=True)
+
+    def _build_tool6_stiffness(self):
+        view = ttk.Frame(self.content_area)
+        self._views["stiffness"] = view
+        self.stiffness_tab = StiffnessTab(
+            view,
+            colors=self.c,
+            set_status=self.set_status,
+            get_df_cornering=lambda: self.df_cornering,
+            get_runs=lambda: self.runs,
+            show_step_header=True,
+        )
+        self.stiffness_tab.pack(fill="both", expand=True)
+
+    def _build_tool7_sketch(self):
+        view = ttk.Frame(self.content_area)
+        self._views["sketch"] = view
+        self.sketch_tab = SimplePacejkaTab(
+            view,
+            colors=self.c,
+            set_status=self.set_status,
+            get_fit_results=lambda: self.fit_results,
+            get_runs=lambda: self.runs,
+            show_step_header=True,
+        )
+        self.sketch_tab.pack(fill="both", expand=True)
+
+    # ------------------------------------------------------------------
+    # EXPORT HELPERS (Used by Unified Export Studio & programmatic callers)
+    # ------------------------------------------------------------------
+    def build_coeffs_json_payload(self) -> dict:
+        clean_fits = {}
+        for k, rec in self.fit_results.items():
+            clean_fits[k] = {
+                "model": rec.get("model", k),
+                "parameters": rec.get("parameters", {}),
+                "r2": rec.get("r2"),
+                "rmse": rec.get("rmse"),
+                "nrmse": rec.get("nrmse"),
+                "n_points": rec.get("n_points"),
+            }
+        return {
+            "schema_version": 2,
+            "conventions": {
+                "FZ": "positive compression [N]",
+                "SA_model": "radians",
+                "SA_UI": "degrees",
+                "SL": "dimensionless ratio",
+            },
+            "runs": [
+                {"filepath": r.filepath, "test_type": r.test_type, "target_fz": r.target_fz, "tol_fz": r.tol_fz, "target_param": r.target_param}
+                for r in self.runs
+            ],
+            "fits": clean_fits,
+        }
+
+    def export_current_tir(self):
+        path = filedialog.asksaveasfilename(
+            title="Export Active Model to .TIR",
+            defaultextension=".tir",
+            filetypes=[("ADAMS / CarSim TIR", "*.tir"), ("All Files", "*.*")],
+            initialfile="PUTM_MF51_Tire.tir",
+        )
         if not path:
             return
-        combined = pd.concat([df for df in [self.df_cornering, self.df_drive] if df is not None], ignore_index=True)
-        combined.to_csv(path, index=False)
-        self._set_status(f"Zapisano dane do {path}")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(self.model.to_tir_content(os.path.splitext(os.path.basename(path))[0]))
+        self.set_status(f"Exported .TIR: {path}")
+
+    def open_fy_excel_export(self):
+        open_excel_export(self.root, self.runs, raw_cache=self.raw_cache, colors=self.c)
+
+    def open_condition_export(self):
+        ConditionExportDialog(self.root, self.runs, raw_cache=self.raw_cache, colors=self.c)
+
+    def export_data(self):
+        if (self.df_cornering is None or self.df_cornering.empty) and (self.df_drive is None or self.df_drive.empty):
+            messagebox.showwarning("No Data", "Process telemetry runs in Step 1 or load FSAE Demo first.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")], initialfile="PUTM_TTC_Filtered.csv")
+        if not path:
+            return
+        chunks = []
+        if self.df_cornering is not None and not self.df_cornering.empty:
+            c_df = self.df_cornering.copy()
+            c_df.insert(0, "TestType", "Cornering")
+            chunks.append(c_df)
+        if self.df_drive is not None and not self.df_drive.empty:
+            d_df = self.df_drive.copy()
+            d_df.insert(0, "TestType", "Drive/Brake")
+            chunks.append(d_df)
+        pd.concat(chunks, ignore_index=True).to_csv(path, index=False)
+        self.set_status(f"Saved filtered TTC telemetry: {path}")
 
     def export_coeffs(self):
         if not self.fit_results:
-            return messagebox.showwarning("Brak", "Najpierw wykonaj dopasowanie.")
-        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json"), ("CSV", "*.csv")])
+            messagebox.showwarning("No Fits", "No fitted parameters stored in Step 2.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")], initialfile="PUTM_Fit_Coefficients_v2.json")
         if not path:
             return
-        if path.lower().endswith(".csv"):
-            rows = []
-            for result in self.fit_results.values():
-                rows.append({key: json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) else value for key, value in result.items()})
-            pd.DataFrame(rows).to_csv(path, index=False)
-        else:
-            with open(path, "w", encoding="utf-8") as f:
-                project = {
-                    "schema_version": 2,
-                    "conventions": {
-                        "FZ": "positive compression [N]",
-                        "SA_model": "radians",
-                        "SA_UI": "degrees",
-                        "SL": "dimensionless ratio",
-                    },
-                    "runs": [asdict(run) for run in self.runs],
-                    "fits": self.fit_results,
-                }
-                json.dump(project, f, indent=2, ensure_ascii=False)
-        self._set_status(f"Zapisano współczynniki do {path}")
+        payload = self.build_coeffs_json_payload()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        self.set_status(f"Exported JSON v2 coefficients: {path}")
+
 
 def main():
-    try:
-        app = PUTMTireApp()
-        app.mainloop()
-    except Exception:
-        traceback.print_exc()
-        sys.exit(1)
+    root = tk.Tk()
+    PUTMTireApp(root)
+    root.mainloop()
+
 
 if __name__ == "__main__":
     main()
