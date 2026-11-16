@@ -32,13 +32,13 @@ def _finite_xy(x, y) -> Tuple[np.ndarray, np.ndarray]:
     x = np.asarray(x, dtype=float).reshape(-1)
     y = np.asarray(y, dtype=float).reshape(-1)
     if x.size != y.size:
-        raise ValueError("Osie danych mają różną liczbę próbek.")
+        raise ValueError("Input X and Y axes have different sample counts.")
     valid = np.isfinite(x) & np.isfinite(y)
     x, y = x[valid], y[valid]
     if x.size < 12:
-        raise ValueError("Do dopasowania potrzeba co najmniej 12 poprawnych punktów.")
+        raise ValueError("At least 12 finite points are required for fitting.")
     if np.ptp(x) <= np.finfo(float).eps:
-        raise ValueError("Zmienna poślizgu nie ma wystarczającego zakresu.")
+        raise ValueError("Slip variable range is too narrow for fitting.")
     return x, y
 
 
@@ -98,7 +98,7 @@ def fit_pure_magic(
     """
     x, y = _finite_xy(slip, force)
     if slip_unit not in {"rad", "ratio"}:
-        raise ValueError("slip_unit musi mieć wartość 'rad' albo 'ratio'.")
+        raise ValueError("slip_unit must be 'rad' or 'ratio'.")
 
     near_zero = np.abs(x) <= max(0.15 * np.max(np.abs(x)), np.deg2rad(1.5) if slip_unit == "rad" else 0.02)
     if np.count_nonzero(near_zero) >= 4:
@@ -151,7 +151,7 @@ def fit_pure_magic(
     ]
     result = min(candidates, key=lambda item: float(np.sum(item.fun**2)))
     if not result.success:
-        raise RuntimeError(f"Optymalizacja nie osiągnęła zbieżności: {result.message}")
+        raise RuntimeError(f"Optimization did not converge: {result.message}")
 
     b, d, e, sh, sv = [float(value) for value in result.x]
     prediction_fit_sign = predict(result.x)
@@ -164,9 +164,9 @@ def fit_pure_magic(
     bound_hits = [name for name, distance in zip(("B", "D", "E", "Sh", "Sv"), bound_distance) if distance < 1e-4]
     warnings = []
     if bound_hits:
-        warnings.append("Parametry na granicy: " + ", ".join(bound_hits))
+        warnings.append("Parameters at bound: " + ", ".join(bound_hits))
     if not np.isfinite(condition) or condition > 1e10:
-        warnings.append("Słaba identyfikowalność parametrów")
+        warnings.append("Weak parameter identifiability")
 
     parameters = {"model": model_name, "B": b, "C": float(shape_factor), "D": d, "E": e, "Sh": sh, "Sv": sv}
     diagnostics = {
@@ -193,16 +193,16 @@ def fit_load_sensitive(alpha, fz, force) -> FitOutput:
     fz = np.abs(np.asarray(fz, dtype=float).reshape(-1))
     force = np.asarray(force, dtype=float).reshape(-1)
     if not (alpha.size == fz.size == force.size):
-        raise ValueError("Kanały alpha, Fz i Fy mają różne długości.")
+        raise ValueError("alpha, Fz, and Fy arrays must have the same length.")
     valid = np.isfinite(alpha) & np.isfinite(fz) & np.isfinite(force) & (fz > 0)
     alpha, fz, force = alpha[valid], fz[valid], force[valid]
     if alpha.size < 30:
-        raise ValueError("Fit load-sensitive wymaga co najmniej 30 poprawnych punktów.")
+        raise ValueError("Load-sensitive fit requires at least 30 finite points.")
 
     fz0 = float(np.median(fz))
     load_levels = np.unique(np.round(fz / 100.0) * 100.0)
     if load_levels.size < 3 or np.ptp(fz) < 0.20 * fz0:
-        raise ValueError("Fit load-sensitive wymaga co najmniej trzech wyraźnych poziomów Fz.")
+        raise ValueError("Load-sensitive fit requires at least three distinct Fz levels.")
 
     alpha_edges = np.linspace(float(alpha.min()), float(alpha.max()), 51)
     alpha_bins = np.clip(np.digitize(alpha, alpha_edges[1:-1]), 0, len(alpha_edges) - 2)
@@ -239,7 +239,7 @@ def fit_load_sensitive(alpha, fz, force) -> FitOutput:
     ]
     result = min(candidates, key=lambda item: float(np.sum(item.fun**2)))
     if not result.success:
-        raise RuntimeError(f"Optymalizacja nie osiągnęła zbieżności: {result.message}")
+        raise RuntimeError(f"Optimization did not converge: {result.message}")
 
     prediction = predict(result.x)
     names = ("pCy1", "pDy1", "pDy2", "pEy1", "pKy1", "pKy2", "pUy1", "pVy1")
@@ -247,9 +247,9 @@ def fit_load_sensitive(alpha, fz, force) -> FitOutput:
     errors, condition = _covariance_diagnostics(result, residual_scale, upper - lower)
     distances = np.minimum((result.x - lower) / (upper - lower), (upper - result.x) / (upper - lower))
     bound_hits = [name for name, distance in zip(names, distances) if distance < 1e-4]
-    warnings = ["Parametry na granicy: " + ", ".join(bound_hits)] if bound_hits else []
+    warnings = ["Parameters at bound: " + ", ".join(bound_hits)] if bound_hits else []
     if not np.isfinite(condition) or condition > 1e10:
-        warnings.append("Słaba identyfikowalność parametrów")
+        warnings.append("Weak parameter identifiability")
     diagnostics = {
         **_metrics(force, prediction),
         "n_points": int(alpha.size), "n_load_levels_100N": int(load_levels.size),
@@ -271,7 +271,7 @@ def build_combined_slip_targets(
     required = {"SA", "IA", "FZ", "SL", "FY"}
     missing = sorted(required.difference(data.columns))
     if missing:
-        raise ValueError(f"Brak kanałów do Combined Slip: {missing}")
+        raise ValueError(f"Missing channels for Combined Slip: {missing}")
 
     source_columns = [name for name in ("__source_path__", "__source__") if name in data.columns]
     # Prefer the absolute path when available; basename is only a fallback.
@@ -279,7 +279,7 @@ def build_combined_slip_targets(
     frame = data[list(required) + source_columns].replace([np.inf, -np.inf], np.nan).dropna(subset=list(required)).copy()
     frame = frame[np.abs(frame["SA"]) >= min_abs_alpha_deg]
     if frame.empty:
-        raise ValueError("Brak punktów Combined Slip przy niezerowym kącie SA.")
+        raise ValueError("No Combined Slip points with non-zero slip angle SA.")
 
     frame["FY_CANON"] = -frame["FY"]
     frame["SA_GROUP"] = (frame["SA"] / 0.25).round() * 0.25
@@ -301,7 +301,7 @@ def build_combined_slip_targets(
     # Only ratios indicating a near-zero/invalid baseline are rejected here.
     targets = targets[(targets["GYK"] >= 0.0) & (targets["GYK"] <= 3.0)]
     if len(targets) < 30:
-        raise ValueError("Za mało dopasowanych punktów bazowych do Combined Slip.")
+        raise ValueError("Too few matched baseline points for Combined Slip.")
     return targets
 
 
@@ -331,12 +331,12 @@ def fit_combined_slip(data: pd.DataFrame) -> FitOutput:
     ]
     result = min(candidates, key=lambda item: float(np.sum(item.fun**2)))
     if not result.success:
-        raise RuntimeError(f"Optymalizacja nie osiągnęła zbieżności: {result.message}")
+        raise RuntimeError(f"Optimization did not converge: {result.message}")
     prediction = pacejka_comb_Gyk(kappa, *result.x)
     errors, condition = _covariance_diagnostics(result, residual_scale, upper - lower)
     distances = np.minimum((result.x - lower) / (upper - lower), (upper - result.x) / (upper - lower))
     bound_hits = [name for name, distance in zip(("rBy1", "rCy1"), distances) if distance < 1e-4]
-    warnings = ["Parametry na granicy: " + ", ".join(bound_hits)] if bound_hits else []
+    warnings = ["Parameters at bound: " + ", ".join(bound_hits)] if bound_hits else []
     parameters = {"model": "CombinedSlip", "rBy1": float(result.x[0]), "rCy1": float(result.x[1])}
     diagnostics = {
         **_metrics(gyk, prediction),
